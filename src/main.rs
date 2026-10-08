@@ -1,7 +1,6 @@
 //! gray-loop — self-driving iteration loops on plain wire primitives.
 //!
-//! Behavior-level reimplementation of mitsupi's `loop` extension
-//! (proprietary — zero code copied): `/loop <goal>` seeds
+//! `/loop <goal>` seeds
 //! `~/.gray/loop/<session>/state.json` and returns a `{prompt}` that puts
 //! the agent to work. On every `agent/before_start` while the state reads
 //! `running` and `iter < max`, the hook bumps `iter` and appends a

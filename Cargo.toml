@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
-description = "Self-driving iteration loop: /loop <goal> re-prompts the agent until done (mitsupi loop port)"
+description = "Self-driving iteration loop: /loop <goal> re-prompts the agent until done"
 
 [[bin]]
 name = "gray-loop"
