@@ -1,0 +1,17 @@
+[package]
+name = "gray-loop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Self-driving iteration loop: /loop <goal> re-prompts the agent until done (mitsupi loop port)"
+
+[[bin]]
+name = "gray-loop"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+strip = true
