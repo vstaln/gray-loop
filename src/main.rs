@@ -47,6 +47,7 @@ fn gray_home() -> PathBuf {
     std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| PathBuf::from(".gray"))
 }
 
@@ -71,11 +72,14 @@ fn write_state(session_id: &str, state: &Value) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
-    std::fs::rename(&tmp, &path).or_else(|_| std::fs::write(&path, serde_json::to_string_pretty(state)?))
+    std::fs::rename(&tmp, &path)
+        .or_else(|_| std::fs::write(&path, serde_json::to_string_pretty(state)?))
 }
 
 fn set_status(session_id: &str, status: &str, note: &str) -> bool {
-    let Some(mut st) = read_state(session_id) else { return false };
+    let Some(mut st) = read_state(session_id) else {
+        return false;
+    };
     st["status"] = json!(status);
     if !note.is_empty() {
         st["notes"] = json!(note);
@@ -148,7 +152,11 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
             None => json!({ "text": "no loop state for this session" }),
         },
         Some("max") => {
-            let Some(n) = argv.get(1).and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0) else {
+            let Some(n) = argv
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+            else {
                 return json!({ "text": "usage: /loop max <positive N>" });
             };
             match read_state(&sid) {
@@ -187,7 +195,9 @@ fn before_start(params: &Value) -> Value {
     if sid.is_empty() {
         return json!({});
     }
-    let Some(mut st) = read_state(&sid) else { return json!({}) };
+    let Some(mut st) = read_state(&sid) else {
+        return json!({});
+    };
     if st.get("status").and_then(Value::as_str) != Some("running") {
         return json!({});
     }
@@ -205,7 +215,11 @@ fn before_start(params: &Value) -> Value {
     }
     let goal = st.get("goal").and_then(Value::as_str).unwrap_or("?");
     let notes = st.get("notes").and_then(Value::as_str).unwrap_or("");
-    let notes = if notes.is_empty() { String::new() } else { format!(" Progress so far: {notes}") };
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" Progress so far: {notes}")
+    };
     json!({ "text": format!(
         "Loop iteration {} of \"{goal}\": continue.{notes} \
          Call the loop_done tool when the goal is verifiably complete.",
@@ -228,7 +242,14 @@ fn call_tool(name: &str, args: &Value, params: &Value) -> Result<String, String>
             match read_state(&sid) {
                 Some(st) if st.get("status").and_then(Value::as_str) == Some("running") => {
                     if set_status(&sid, status, reason) {
-                        Ok(format!("loop ended: {status}{}", if reason.is_empty() { String::new() } else { format!(" — {reason}") }))
+                        Ok(format!(
+                            "loop ended: {status}{}",
+                            if reason.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {reason}")
+                            }
+                        ))
                     } else {
                         Err("couldn't write loop state".into())
                     }
@@ -287,7 +308,9 @@ fn main() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let (reply, exit) = handle(&req);
         if let Some(reply) = reply {
             writeln!(stdout, "{reply}")?;
@@ -305,7 +328,9 @@ mod tests {
     use super::*;
 
     fn call(method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
+        handle(&json!({ "id": 1, "method": method, "params": params }))
+            .0
+            .unwrap()
     }
 
     /// Point state_path at a scratch GRAY_HOME for the duration of `f`.
@@ -336,21 +361,38 @@ mod tests {
         with_home("life", |home| {
             let sess = json!({ "id": "s-1", "cwd": "/x" });
             // /loop <goal> → prompt + state file
-            let r = call("command/run", json!({ "name": "/loop", "argv": ["fix", "tests"], "session": sess }));
-            assert!(r["result"]["prompt"].as_str().unwrap().contains("fix tests"));
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["fix", "tests"], "session": sess }),
+            );
+            assert!(
+                r["result"]["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fix tests")
+            );
             let st: Value = serde_json::from_str(
                 &std::fs::read_to_string(home.join("loop/s-1/state.json")).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(st["status"], "running");
             // before_start nudges and counts
             let r = call("agent/before_start", json!({ "session": sess }));
-            assert!(r["result"]["text"].as_str().unwrap().contains("Loop iteration 1"));
+            assert!(
+                r["result"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Loop iteration 1")
+            );
             // loop_done stops it
-            let r = call("tool/call", json!({
-                "name": "loop_done",
-                "args": { "status": "done", "reason": "all green" },
-                "session": sess,
-            }));
+            let r = call(
+                "tool/call",
+                json!({
+                    "name": "loop_done",
+                    "args": { "status": "done", "reason": "all green" },
+                    "session": sess,
+                }),
+            );
             assert!(r["result"]["content"].as_str().unwrap().contains("done"));
             // no more nudges
             let r = call("agent/before_start", json!({ "session": sess }));
@@ -362,8 +404,14 @@ mod tests {
     fn iteration_cap_forces_failed() {
         with_home("cap", |_| {
             let sess = json!({ "id": "s-2" });
-            call("command/run", json!({ "name": "/loop", "argv": ["g"], "session": sess }));
-            call("command/run", json!({ "name": "/loop", "argv": ["max", "2"], "session": sess }));
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["g"], "session": sess }),
+            );
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["max", "2"], "session": sess }),
+            );
             for expect_nudge in [true, true, false] {
                 let r = call("agent/before_start", json!({ "session": sess }));
                 assert_eq!(r["result"].get("text").is_some(), expect_nudge);
@@ -380,11 +428,20 @@ mod tests {
             // no loop: everything degrades to text/{}
             let r = call("agent/before_start", json!({ "session": sess }));
             assert_eq!(r["result"], json!({}));
-            let r = call("command/run", json!({ "name": "/loop", "argv": ["status"], "session": sess }));
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["status"], "session": sess }),
+            );
             assert!(r["result"]["text"].as_str().unwrap().contains("no loop"));
             // start then stop
-            call("command/run", json!({ "name": "/loop", "argv": ["x"], "session": sess }));
-            let r = call("command/run", json!({ "name": "/loop", "argv": ["stop"], "session": sess }));
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["x"], "session": sess }),
+            );
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["stop"], "session": sess }),
+            );
             assert!(r["result"]["text"].as_str().unwrap().contains("stopped"));
             let st = read_state("s-3").unwrap();
             assert_eq!(st["status"], "failed");
@@ -393,9 +450,12 @@ mod tests {
 
     #[test]
     fn loop_done_rejects_bad_status() {
-        let r = call("tool/call", json!({
-            "name": "loop_done", "args": { "status": "maybe" }, "session": { "id": "s-9" }
-        }));
+        let r = call(
+            "tool/call",
+            json!({
+                "name": "loop_done", "args": { "status": "maybe" }, "session": { "id": "s-9" }
+            }),
+        );
         assert_eq!(r["result"]["is_error"], true);
     }
 
