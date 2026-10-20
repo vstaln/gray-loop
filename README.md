@@ -1,7 +1,7 @@
 <div align="center">
   <img alt="gray-loop" src="assets/icon.svg" width="120" height="120" />
   <h1>gray-loop</h1>
-  <p><strong>Self-driving iteration loops: /loop <goal> keeps going until the goal is done.</strong></p>
+  <p><strong>/loop [interval] &lt;prompt&gt; — scheduled and self-paced loops for gray.</strong></p>
   <p>
     <a href="https://gray.alignment.id">Website</a> ·
     <a href="https://gray.alignment.id/plugins/gray-loop">Store</a> ·
@@ -21,71 +21,68 @@
 gray plugin install gray-loop
 ```
 
-Self-driving iteration loops built on plain wire primitives: `/loop <goal>`
-keeps re-prompting the agent until the goal is verifiably done, the cap is
-hit, or it's stopped.
+`/loop [interval] <prompt>` — Claude Code's `/loop`, rebuilt for gray — plus a
+checklist goal loop that runs until the work verifiably passes.
 
 A sidecar plugin for [gray](https://github.com/vstaln/gray), scaffolded by
 [gray-account](https://github.com/vstaln/gray-account).
 
-## What it does
+## Usage
 
-- `/loop <goal> [--review] [--gate "<verify cmd>"]` — seeds
-  `~/.gray/loop/<session>/state.json` (`{goal, iter, max, status, notes,
-  tasks[], learnings[], steer[], gate?, gate_run?, review?, review_run?,
-  review_passed?, review_disabled?}`) and returns a `{prompt}` putting the
-  agent to work on the goal.
-- `agent/before_start` hook — while the state reads `running` and
-  `iter < max`, bumps `iter` and appends a continue message carrying the
-  goal, the task checklist, the latest learnings, any queued steering, and
-  the gate reminder. Counting lives in the hook, so a model that never
-  writes state still terminates at the cap.
-- `loop_task` tool — the deterministic exit oracle: `add` a checkable unit,
-  `pass`/`fail` it by 1-based id, exact text, unique prefix, or unique
-  substring. The plugin ends the loop itself once every task passes; a
-  manual `loop_done` is rejected while tasks are unchecked.
-- `--gate "<cmd>"` — a verification command (runs `sh -c` from the session
-  cwd, 180s cap). Once all tasks pass — or a taskless `loop_done` is called
-  — the gate is armed in the background: combined output streams to
-  `gate.out`, the exit code to `gate.code`. Polls (`loop_done`, the next
-  `before_start` iteration) resolve it: exit 0 ends the loop, anything else
-  rejects the "done" with the output tail and the loop keeps going. A
-  running gate is killed on `/loop stop`, `loop_done "failed"`, cap-out, or
-  timeout.
-- `--review` — a second-agent stage ahead of the gate. Once tasks pass (or
-  a taskless `loop_done` lands), a detached `gray -p` child reviews the
-  real state of the work (binary: `$GRAY_LOOP_REVIEW_BIN`, else `$GRAY_BIN`,
-  else `gray` on PATH; 600s cap; output to `review.out`, exit to
-  `review.code`; the child shows up in the Agents view as
-  `loop-review-*`). Its reply must end with one verdict line:
-  `VERDICT: CLEAR` proceeds to the gate; `VERDICT: RESOLVABLE — <fix>`
-  queues the finding as steering and rejects the "done"; `VERDICT: NOVEL —
-  <issue>` escalates to a blocking `host/ask` modal — *send back to work*
-  (optional guidance rides as a note), *ship anyway*, or *stop the loop*.
-  No ask channel → the issue degrades to a steering note and the loop keeps
-  going; a missing `gray` disables review outright. A failed gate clears
-  `review_passed`, so post-gate fixes get re-reviewed.
-- `loop_learn` tool — append a durable learning (last 3 ride every
-  continue prompt; log capped at 50).
-- `loop_done` tool — `{status: "done"|"failed", reason}` ends the loop;
-  with a gate configured, "done" arms/polls it first.
-- `/loop status` — report goal, iter/max, task tally, gate (incl. running),
-  notes.
-- `/loop tasks` — render the checklist.
-- `/loop steer <msg>` — queue a steering message for the next iteration.
-- `/loop stop` — force status `failed`.
-- `/loop max N` — retune the iteration cap (default 10).
-- `/loop list` — every session's loop, globbed from `~/.gray/loop/*/`.
+```
+/loop 5m check the deploy            re-run every 5m (also: "... every 2 hours")
+/loop babysit PR 1234 until it merges   self-paced: the agent picks each delay
+/loop                                self-paced over .gray/loop.md (or ~/.gray/loop.md)
+/loop goal <goal> [--gate "cmd"] [--review]   checklist loop until it verifiably passes
+/loop status · stop · steer <msg> · max N · tasks · list
+```
 
-State honors `$GRAY_HOME` first, then `$HOME/.gray`. Everything fails open:
-odd state files, missing sessions, bad args → `{}` or a text note, never a
-crash.
+Interval parsing follows Claude Code: a leading `^\d+[smhd]$` token, else a
+trailing `every <N><unit>` / `every <N> <unit-word>` clause (`check every PR`
+has no interval), else no interval → self-paced. `--max N` caps ticks
+(default 50). Fixed intervals clamp to 10s–7d.
+
+## How it works
+
+The first tick is the command's `{prompt}`. When a tick's turn ends
+(`event/notify turn_end`, dispatched even in lean mode), the sidecar arms
+a timer; when it fires, the next tick is queued in
+`<gray home>/cron/inbox/<session>/loop-*.json` and the REPL's inbox poller
+wakes the session with it — while the session stays open, like Claude Code.
+
+- **Fixed** (`/loop 5m …`) — the next tick arms itself every interval.
+- **Self-paced** (`/loop …`) — *pull*, not push, like Claude Code's
+  `ScheduleWakeup`: each tick the model must re-arm with
+  `gray loop wakeup <secs> [--reason …] [--noop]` (0 = continue now, up to
+  3600) or end it with `gray loop stop "<reason>"`. No re-arm → the loop
+  ends after that tick. The `loop_wakeup` tool does the same.
+- Control goes through **bash** because some providers (claude-sub's MCP
+  bridge) only forward an allowlisted set of host tools — bash is the one
+  every model has. `$GRAY_SESSION_ID` picks the session.
+- `host/say` prints "tick N in 5m" / "loop ended" lines (`host.say`).
+- `/loop stop` bumps nothing — it flips `status`, and stale timers notice
+  the state change (each arming carries an epoch) and exit.
+- `/loop steer <msg>` rides the next tick's prompt.
+
+## Goal loop (`/loop goal …`)
+
+The checklist loop from 0.2 (now behind the `goal` word, or implied by
+`--gate`/`--review`): state in `~/.gray/loop/<session>/state.json`, tasks as
+the deterministic exit oracle (`loop_task` / `gray loop task add|pass|fail`),
+learnings (`loop_learn` / `gray loop learn`), `loop_done` /
+`gray loop done|fail`, a background `--gate` command that must exit 0, and an
+optional `--review` second-agent stage (`VERDICT: CLEAR|RESOLVABLE|NOVEL`,
+NOVEL escalates to a `host/ask` modal). Iteration cap default 10.
+
+State honors `$GRAY_HOME` first, then `$HOME/.gray`. Shutdown only reaps the
+sessions this sidecar served. Everything fails open.
 
 ## Wire
 
-`command/run` (`/loop`) + `agent/before_start` (hook) + `tool/call`
-(`loop_done`, `loop_task`, `loop_learn`). Protocol `2.0` (mutating hook).
-Declares `capabilities: ["host.ask"]` for the human-review step; the ask
+`command/run` (`/loop`) + `event/notify` (`turn_end`) + `agent/before_start`
+(hook) + `tool/call` (`loop_wakeup`, `loop_done`, `loop_task`, `loop_learn`) +
+the `gray loop <verb>` CLI. Protocol `2.0` (mutating hook). Declares
+`capabilities: ["host.ask", "host.say"]` — the ask for the human-review step; the ask
 payloads are built with the shared [`gray-questions`
 crate](https://github.com/vstaln/gray-questions) (`git` dep, tag
 `v0.1.1`).

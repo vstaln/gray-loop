@@ -40,6 +40,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+mod sched;
+
 const DEFAULT_MAX: u64 = 10;
 const MAX_LEARNINGS: usize = 50;
 const GATE_TIMEOUT_SECS: u64 = 180;
@@ -84,6 +86,19 @@ fn manifest() -> Value {
                 }
             },
             {
+                "name": "loop_wakeup",
+                "description": "Pace a self-paced /loop: after this tick's work, schedule the next tick (delay_seconds 0 = continue right away, up to 3600) or end the loop (stop: true). If you don't re-arm during a tick, the loop ends after it. Same as running `gray loop wakeup <secs>` / `gray loop stop` in bash.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "delay_seconds": { "type": "integer", "minimum": 0, "maximum": 3600, "description": "Seconds after this turn ends to run the next tick. 0 for active work; longer when polling something external." },
+                        "reason": { "type": "string", "description": "One sentence: why this delay (shown to the user)." },
+                        "noop": { "type": "boolean", "description": "true if this tick changed nothing." },
+                        "stop": { "type": "boolean", "description": "true ends the loop (finished, blocked on the user, or asked to stop); other fields ignored." }
+                    }
+                }
+            },
+            {
                 "name": "loop_task",
                 "description": "Manage the active /loop's task checklist — the deterministic exit oracle. op \"add\" appends a task (needs text). op \"pass\"/\"fail\" set a task's passes flag (needs task: 1-based id, exact text, unique prefix, or unique substring). op \"list\" shows the checklist. When every task passes the loop ends itself.",
                 "parameters": {
@@ -110,7 +125,7 @@ fn manifest() -> Value {
         ],
         "commands": ["/loop"],
         "hooks": ["agent/before_start"],
-        "capabilities": ["host.ask"],
+        "capabilities": ["host.ask", "host.say"],
     })
 }
 
@@ -174,13 +189,13 @@ fn inbox_dir(sid: &str) -> PathBuf {
     gray_home().join("cron").join("inbox").join(sid)
 }
 
-fn queue_wake(sid: &str, card: &str, prompt: &str) {
+fn queue_wake(sid: &str, card: &str, prompt: &str) -> Option<String> {
     if sid.is_empty() {
-        return;
+        return None;
     }
     let dir = inbox_dir(sid);
     if std::fs::create_dir_all(&dir).is_err() {
-        return;
+        return None;
     }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -189,11 +204,13 @@ fn queue_wake(sid: &str, card: &str, prompt: &str) {
     let name = format!("loop-{nonce}-{}.json", std::process::id());
     let tmp = dir.join(format!(".{name}.tmp"));
     let body = json!({ "card": card, "prompt": prompt });
-    if std::fs::write(&tmp, body.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, dir.join(name));
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+    if std::fs::write(&tmp, body.to_string()).is_ok()
+        && std::fs::rename(&tmp, dir.join(&name)).is_ok()
+    {
+        return Some(name);
     }
+    let _ = std::fs::remove_file(&tmp);
+    None
 }
 
 fn purge_wakes(sid: &str) {
@@ -892,6 +909,7 @@ fn start_goal(session_id: &str, goal: &str, gate: Option<&str>, review: bool) ->
     }
     purge_wakes(session_id);
     let existing_max = read_state(session_id)
+        .filter(|st| !sched::is_sched(st))
         .and_then(|st| st.get("max").and_then(Value::as_u64))
         .unwrap_or(DEFAULT_MAX);
     let mut st = json!({
@@ -946,8 +964,12 @@ fn start_goal(session_id: &str, goal: &str, gate: Option<&str>, review: bool) ->
             ending every turn. In a git repo, prefer committing completed units so progress\n\
             survives context loss.{gate_line}{review_line}\n\n\
          When the goal is verifiably complete call loop_done with status \"done\"; if it turns out\n\
-         to be unachievable call it with \"failed\" and a reason.",
-        path.display()
+         to be unachievable call it with \"failed\" and a reason.\n\n\
+         If the loop_* tools aren't in your tool list, use bash instead (same effect):\n\
+         `{cli} task add \"<text>\"` · `{cli} task pass <N>` · `{cli} learn \"<text>\"` ·\n\
+         `{cli} done \"<reason>\"` · `{cli} fail \"<reason>\"`.",
+        path.display(),
+        cli = sched::cli(),
     ) })
 }
 
@@ -955,6 +977,41 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
     let sid = session_id(params);
     if sid.is_empty() {
         return json!({ "text": "loop: no session id" });
+    }
+    let cwd = session_cwd(params);
+    // `/loop goal <goal>` (or any --gate/--review flag) → the checklist
+    // goal loop. `/loop stop|status|…` → control. Everything else is
+    // Claude Code's `/loop [interval] <prompt>`.
+    if argv.first() == Some(&"goal") {
+        return goal_run(&argv[1..], &sid, params);
+    }
+    if argv.iter().any(|w| *w == "--gate" || *w == "--review") {
+        return goal_run(argv, &sid, params);
+    }
+    let control = matches!(
+        argv.first().copied(),
+        Some("stop" | "status" | "tasks" | "list" | "steer" | "max" | "help")
+    );
+    let is_control = match argv.first().copied() {
+        Some("steer") => true,
+        Some("max") => argv.len() == 2 && argv[1].parse::<u64>().is_ok_and(|n| n > 0),
+        Some(_) if control => argv.len() == 1,
+        _ => false,
+    };
+    if !is_control {
+        if let Some(reply) = sched::start(argv, &sid, &cwd) {
+            return reply;
+        }
+        // bare /loop, no loop.md: show what's running, else help
+        if let Some(st) = read_state(&sid)
+            && st.get("status").and_then(Value::as_str) == Some("running")
+        {
+            return run_command(&["status"], params);
+        }
+        return json!({ "text": help_text() });
+    }
+    if argv.first() == Some(&"help") {
+        return json!({ "text": help_text() });
     }
     // Bare-word subcommands only fire alone — "/loop stop the rollout" is
     // a goal, not a stop. `max` needs its numeric arg to be one.
@@ -992,17 +1049,23 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                 }
                 st.as_object_mut().map(|o| o.remove("review_run"));
                 gate_clear(&mut st);
-                st["status"] = json!("failed");
+                let was = st.get("status").and_then(Value::as_str) == Some("running");
+                st["status"] = json!(if sched::is_sched(&st) { "stopped" } else { "failed" });
                 st["notes"] = json!("stopped by user via /loop stop");
+                if !was {
+                    purge_wakes(&sid);
+                    return json!({ "text": "no running loop for this session" });
+                }
                 let ok = write_state(&sid, &st).is_ok();
                 purge_wakes(&sid);
                 if ok {
-                    return json!({ "text": "loop stopped (status → failed)" });
+                    return json!({ "text": "loop stopped" });
                 }
             }
             json!({ "text": "no active loop for this session" })
         }
         Some("status") => match read_state(&sid) {
+            Some(st) if sched::is_sched(&st) => json!({ "text": sched::status_line(&st) }),
             Some(st) => {
                 let ts = tasks(&st);
                 let task_line = if ts.is_empty() {
@@ -1065,7 +1128,7 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
         Some("steer") => {
             let msg = argv[1..].join(" ");
             if msg.is_empty() {
-                return json!({ "text": "usage: /loop steer <message for next iteration>" });
+                return json!({ "text": "usage: /loop steer <message for the next tick>" });
             }
             match read_state(&sid) {
                 Some(mut st) if st["status"].as_str() == Some("running") => {
@@ -1073,7 +1136,7 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                     q.push(json!(msg));
                     st["steer"] = json!(q);
                     if write_state(&sid, &st).is_ok() {
-                        json!({ "text": "steering queued for next iteration" })
+                        json!({ "text": "steering queued for the next tick" })
                     } else {
                         json!({ "text": "loop: couldn't write state" })
                     }
@@ -1119,7 +1182,13 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                         st.get("status").and_then(Value::as_str).unwrap_or("?"),
                         st.get("iter").and_then(Value::as_u64).unwrap_or(0),
                         st.get("max").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX),
-                        st.get("goal").and_then(Value::as_str).unwrap_or("?"),
+                        st.get("goal")
+                            .or_else(|| st.get("prompt"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .lines()
+                            .next()
+                            .unwrap_or("?"),
                     ));
                 }
             }
@@ -1130,13 +1199,20 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                 json!({ "text": format!("loops ({}):\n{}", lines.len(), lines.join("\n")) })
             }
         }
-        Some(_) => goal_run(argv, &sid, params),
-        None => json!({ "text": format!(
-            "gray-loop {} — /loop <goal> [--review] [--gate \"cmd\"] runs the goal in self-driving iterations. \
-             /loop status · /loop tasks · /loop steer <msg> · /loop stop · /loop max N · /loop list",
-            env!("CARGO_PKG_VERSION")
-        ) }),
+        _ => json!({ "text": help_text() }),
     }
+}
+
+fn help_text() -> String {
+    format!(
+        "gray-loop {}\n\
+         /loop 5m <prompt>        re-run the prompt every 5m (also: <prompt> every 2 hours)\n\
+         /loop <prompt>           self-paced — the agent picks when the next tick runs\n\
+         /loop                    self-paced over .gray/loop.md (or ~/.gray/loop.md)\n\
+         /loop goal <goal> [--gate \"cmd\"] [--review]   checklist loop until the goal verifiably passes\n\
+         /loop status · stop · steer <msg> · max N · tasks · list",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// `/loop <goal> [--review] [--gate "<cmd>"]` — everything that isn't a
@@ -1151,7 +1227,7 @@ fn goal_run(argv: &[&str], sid: &str, params: &Value) -> Value {
     let gate = if split < words.len() {
         match words[split + 1..].join(" ") {
             g if g.is_empty() => {
-                return json!({ "text": "usage: /loop <goal> [--review] [--gate \"<verify command>\"]" });
+                return json!({ "text": "usage: /loop goal <goal> [--review] [--gate \"<verify command>\"]" });
             }
             g => Some(g),
         }
@@ -1173,7 +1249,7 @@ fn goal_run(argv: &[&str], sid: &str, params: &Value) -> Value {
         .collect::<Vec<_>>()
         .join(" ");
     if goal.is_empty() {
-        return json!({ "text": "usage: /loop <goal> [--review] [--gate \"<verify command>\"]" });
+        return json!({ "text": "usage: /loop goal <goal> [--review] [--gate \"<verify command>\"]" });
     }
     start_goal(sid, &goal, gate.as_deref(), review)
 }
@@ -1185,6 +1261,9 @@ fn goal_run(argv: &[&str], sid: &str, params: &Value) -> Value {
 fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
     let sid = session_id(params);
     if sid.is_empty() {
+        return json!({});
+    }
+    if read_state(&sid).is_some_and(|st| sched::is_sched(&st)) {
         return json!({});
     }
     let cwd = session_cwd(params);
@@ -1206,6 +1285,10 @@ fn on_turn_end(params: &Value, link: Option<&HostLink>) {
     let Some(st) = read_state(&sid) else {
         return;
     };
+    if sched::is_sched(&st) {
+        sched::on_turn_end(&sid, link);
+        return;
+    }
     if st.get("status").and_then(Value::as_str) != Some("running") {
         return;
     }
@@ -1389,7 +1472,7 @@ fn iterate(sid: &str, cwd: &str, link: Option<&HostLink>, from_bs: bool) -> Opti
         ));
     }
     parts.push(if ts.is_empty() {
-        "Continue. Call loop_done when the goal is verifiably complete.".to_string()
+        format!("Continue. Call loop_done when the goal is verifiably complete (no loop tools? run `{} done \"<reason>\"` in bash).", sched::cli())
     } else {
         "Continue with the next unchecked task; mark it with loop_task when it truly passes."
             .to_string()
@@ -1402,7 +1485,7 @@ fn iterate(sid: &str, cwd: &str, link: Option<&HostLink>, from_bs: bool) -> Opti
     let mut wake_parts = parts.clone();
     let next_label = if from_bs { iter + 2 } else { iter + 1 };
     wake_parts[0] = format!("Loop iteration {} of {max} — goal: \"{goal}\"", next_label);
-    queue_wake(
+    let _ = queue_wake(
         sid,
         &format!("loop iteration {} of {max} — {goal}", next_label),
         &format!(
@@ -1424,6 +1507,17 @@ fn call_tool(
         return Err("no session id".into());
     }
     match name {
+        "loop_wakeup" => {
+            if args.get("stop").and_then(Value::as_bool) == Some(true) {
+                return cli_stop(&sid, args.get("reason").and_then(Value::as_str).unwrap_or(""));
+            }
+            sched::wakeup(
+                &sid,
+                args.get("delay_seconds").and_then(Value::as_u64),
+                args.get("reason").and_then(Value::as_str).unwrap_or(""),
+                args.get("noop").and_then(Value::as_bool).unwrap_or(false),
+            )
+        }
         "loop_done" => {
             let status = args.get("status").and_then(Value::as_str).unwrap_or("");
             if !matches!(status, "done" | "failed") {
@@ -1602,9 +1696,29 @@ fn call_tool(
     }
 }
 
+/// Sessions this sidecar served — shutdown only reaps their children and
+/// wakes, never another live window's loop.
+static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn note_session(params: &Value) {
+    let sid = session_id(params);
+    if sid.is_empty() {
+        return;
+    }
+    if let Ok(mut v) = SEEN.lock()
+        && !v.contains(&sid)
+    {
+        v.push(sid);
+    }
+}
+
 fn shutdown_cleanup() {
+    let seen = SEEN.lock().map(|v| v.clone()).unwrap_or_default();
     if let Ok(rd) = std::fs::read_dir(gray_home().join("loop")) {
         for ent in rd.flatten() {
+            if !seen.iter().any(|s| *s == ent.file_name().to_string_lossy()) {
+                continue;
+            }
             if let Ok(text) = std::fs::read_to_string(ent.path().join("state.json"))
                 && let Ok(st) = serde_json::from_str::<Value>(&text)
             {
@@ -1622,6 +1736,9 @@ fn shutdown_cleanup() {
     }
     if let Ok(rd) = std::fs::read_dir(gray_home().join("cron").join("inbox")) {
         for ent in rd.flatten() {
+            if !seen.iter().any(|s| *s == ent.file_name().to_string_lossy()) {
+                continue;
+            }
             if let Ok(rd2) = std::fs::read_dir(ent.path()) {
                 for f in rd2.flatten() {
                     if f.file_name().to_string_lossy().starts_with("loop-") {
@@ -1639,6 +1756,7 @@ fn handle(req: &Value, link: Option<&HostLink>) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
+    note_session(&params);
     let Some(id) = id else {
         // Notifications (no id): turn_end is the lean-mode loop drive;
         // plugin/shutdown cleans up detached children before exit.
@@ -1684,10 +1802,155 @@ fn handle(req: &Value, link: Option<&HostLink>) -> (Option<Value>, bool) {
     (Some(json!({ "id": id, "result": result })), false)
 }
 
+// ── CLI: `gray loop <verb>` — the bash path every model has ───
+
+/// Stop whatever loop `sid` runs (either mode), killing gate/review kids.
+fn cli_stop(sid: &str, reason: &str) -> Result<String, String> {
+    let Some(mut st) = read_state(sid) else {
+        return Err(format!("no /loop in session {sid}"));
+    };
+    if st.get("status").and_then(Value::as_str) != Some("running") {
+        purge_wakes(sid);
+        return Ok("the loop had already ended".into());
+    }
+    for key in ["gate_run", "review_run"] {
+        if let Some(pid) = st.get(key).and_then(|g| g.get("pid")).and_then(Value::as_u64) {
+            kill_tree(pid);
+        }
+    }
+    st.as_object_mut().map(|o| o.remove("review_run"));
+    gate_clear(&mut st);
+    let sched = sched::is_sched(&st);
+    st["status"] = json!(if sched { "done" } else { "failed" });
+    st["notes"] = json!(if reason.is_empty() { "stopped by the agent".to_string() } else { reason.to_string() });
+    write_state(sid, &st).map_err(|e| format!("couldn't write state: {e}"))?;
+    purge_wakes(sid);
+    Ok("loop ended — no more ticks will run".into())
+}
+
+fn cli_usage() -> String {
+    let c = sched::cli();
+    format!(
+        "usage (session from $GRAY_SESSION_ID or --session ID):\n\
+         \x20 {c} wakeup <seconds> [--reason \"why\"] [--noop]   re-arm a self-paced /loop (0..{})\n\
+         \x20 {c} stop [\"reason\"]                            end the loop\n\
+         \x20 {c} status\n\
+         \x20 {c} done [\"reason\"] | fail [\"reason\"]          goal loop: same as loop_done\n\
+         \x20 {c} task add \"text\" | pass N | fail N | list     goal loop: same as loop_task\n\
+         \x20 {c} learn \"text\"                               goal loop: same as loop_learn",
+        sched::MAX_WAKE
+    )
+}
+
+fn cli(args: &[String]) -> i32 {
+    let mut sid = std::env::var("GRAY_SESSION_ID").unwrap_or_default();
+    let mut rest: Vec<String> = vec![];
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--session" {
+            if let Some(v) = it.next() {
+                sid = v.clone();
+            }
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    let verb = rest.first().cloned().unwrap_or_default();
+    if matches!(verb.as_str(), "" | "help" | "--help" | "-h") {
+        println!("{}", cli_usage());
+        return 0;
+    }
+    if sid.is_empty() {
+        eprintln!("gray loop: no session — run this from a gray bash tool call, or pass --session ID");
+        return 2;
+    }
+    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let params = json!({ "session": { "id": sid, "cwd": cwd } });
+    let tail = || rest[1..].join(" ");
+    let res: Result<String, String> = match verb.as_str() {
+        "wakeup" | "wake" | "next" => {
+            let mut delay = None;
+            let mut reason = String::new();
+            let mut noop = false;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--noop" => noop = true,
+                    "--reason" => {
+                        reason = rest.get(i + 1).cloned().unwrap_or_default();
+                        i += 1;
+                    }
+                    w => {
+                        if delay.is_none() && let Ok(n) = w.trim_end_matches('s').parse::<u64>() {
+                            delay = Some(n);
+                        } else if reason.is_empty() {
+                            reason = w.to_string();
+                        } else {
+                            reason = format!("{reason} {w}");
+                        }
+                    }
+                }
+                i += 1;
+            }
+            sched::wakeup(&sid, delay, &reason, noop)
+        }
+        "stop" | "end" => cli_stop(&sid, &tail()),
+        "status" => read_state(&sid)
+            .map(|st| {
+                if sched::is_sched(&st) {
+                    sched::status_line(&st)
+                } else {
+                    run_command(&["status"], &params)["text"].as_str().unwrap_or("").to_string()
+                }
+            })
+            .ok_or_else(|| format!("no /loop in session {sid}")),
+        "done" | "fail" | "failed" => call_tool(
+            "loop_done",
+            &json!({ "status": if verb == "done" { "done" } else { "failed" }, "reason": tail() }),
+            &params,
+            None,
+        ),
+        "task" => {
+            let op = rest.get(1).cloned().unwrap_or_else(|| "list".into());
+            let arg = rest[2.min(rest.len())..].join(" ");
+            let mut a = json!({ "op": op });
+            if op == "add" {
+                a["text"] = json!(arg);
+            } else if !arg.is_empty() {
+                a["task"] = arg.parse::<u64>().map(|n| json!(n)).unwrap_or(json!(arg));
+            }
+            call_tool("loop_task", &a, &params, None)
+        }
+        "learn" => call_tool("loop_learn", &json!({ "text": tail() }), &params, None),
+        other => Err(format!("unknown verb `{other}`\n{}", cli_usage())),
+    };
+    match res {
+        Ok(t) => {
+            println!("{t}");
+            0
+        }
+        Err(t) => {
+            eprintln!("{t}");
+            1
+        }
+    }
+}
+
+const CLI_VERBS: &[&str] = &[
+    "wakeup", "wake", "next", "stop", "end", "status", "done", "fail", "failed", "task", "learn",
+    "help", "--help", "-h", "--session",
+];
+
 fn main() -> std::io::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("manifest") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("manifest") {
         println!("{}", manifest());
         return Ok(());
+    }
+    if let Some(a) = args.first()
+        && CLI_VERBS.contains(&a.as_str())
+    {
+        std::process::exit(cli(&args));
     }
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -1779,7 +2042,7 @@ mod tests {
             // /loop <goal> → prompt + state file
             let r = call(
                 "command/run",
-                json!({ "name": "/loop", "argv": ["fix", "tests"], "session": sess }),
+                json!({ "name": "/loop", "argv": ["goal", "fix", "tests"], "session": sess }),
             );
             assert!(
                 r["result"]["prompt"]
@@ -1822,7 +2085,7 @@ mod tests {
             let sess = json!({ "id": "s-2" });
             call(
                 "command/run",
-                json!({ "name": "/loop", "argv": ["g"], "session": sess }),
+                json!({ "name": "/loop", "argv": ["goal", "g"], "session": sess }),
             );
             call(
                 "command/run",
@@ -1852,7 +2115,7 @@ mod tests {
             // start then stop
             call(
                 "command/run",
-                json!({ "name": "/loop", "argv": ["x"], "session": sess }),
+                json!({ "name": "/loop", "argv": ["goal", "x"], "session": sess }),
             );
             let r = call(
                 "command/run",
@@ -1884,7 +2147,7 @@ mod tests {
     #[test]
     fn manifest_claims_ask_capability() {
         let m = call("plugin/manifest", Value::Null)["result"].clone();
-        assert_eq!(m["capabilities"], json!(["host.ask"]));
+        assert_eq!(m["capabilities"], json!(["host.ask", "host.say"]));
     }
 
     #[test]
@@ -2075,6 +2338,113 @@ echo '{verdict_line}'
             assert!(r["result"]["content"].as_str().unwrap().contains("human"));
             assert_eq!(read_state("s-r4").unwrap()["status"], "running");
             unsafe { std::env::remove_var("GRAY_LOOP_REVIEW_BIN") };
+        });
+    }
+
+    #[test]
+    fn interval_parsing_matches_claude_code() {
+        let p = |s: &str| sched::parse_interval(&s.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(p("5m check the deploy"), (Some(300), "check the deploy".into()));
+        assert_eq!(p("check the deploy every 20m"), (Some(1200), "check the deploy".into()));
+        assert_eq!(p("check the deploy every 2 hours"), (Some(7200), "check the deploy".into()));
+        assert_eq!(p("check every PR"), (None, "check every PR".into()));
+        assert_eq!(p("fix the tests"), (None, "fix the tests".into()));
+        assert_eq!(p("5x is not an interval"), (None, "5x is not an interval".into()));
+    }
+
+    #[test]
+    fn plain_loop_prompt_is_schedule_mode_and_control_words_still_work() {
+        with_home("schedroute", |_| {
+            let sess = json!({ "id": "s-sr", "cwd": "/x" });
+            let r = call("command/run", json!({ "name": "/loop", "argv": ["stop", "the", "rollout"], "session": sess }));
+            assert!(r["result"]["prompt"].as_str().unwrap().contains("stop the rollout"));
+            let st = read_state("s-sr").unwrap();
+            assert_eq!(st["mode"], "schedule");
+            assert_eq!(st["interval"], Value::Null);
+            let r = call("command/run", json!({ "name": "/loop", "argv": ["status"], "session": sess }));
+            assert!(r["result"]["text"].as_str().unwrap().contains("self-paced"));
+            let r = call("command/run", json!({ "name": "/loop", "argv": ["stop"], "session": sess }));
+            assert_eq!(r["result"]["text"], "loop stopped");
+            assert_eq!(read_state("s-sr").unwrap()["status"], "stopped");
+        });
+    }
+
+    #[test]
+    fn self_paced_ends_without_rearm_and_continues_with_one() {
+        with_home("selfpace", |home| {
+            let sid = "s-sp";
+            let sess = json!({ "id": sid, "cwd": "/x" });
+            let notify = |_: ()| {
+                handle(&json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }), None);
+            };
+            call("command/run", json!({ "name": "/loop", "argv": ["poll", "ci"], "session": sess }));
+            // tick 1 re-arms with 0 → tick 2 queued in the inbox at once
+            assert!(sched::wakeup(sid, Some(0), "active", false).unwrap().contains("right after"));
+            notify(());
+            std::thread::sleep(Duration::from_millis(300));
+            let inbox = home.join("cron").join("inbox").join(sid);
+            let files: Vec<_> = std::fs::read_dir(&inbox).unwrap().flatten().collect();
+            assert_eq!(files.len(), 1, "tick 2 queued");
+            let body: Value = serde_json::from_str(&std::fs::read_to_string(files[0].path()).unwrap()).unwrap();
+            assert!(body["prompt"].as_str().unwrap().contains("tick 2"));
+            let st = read_state(sid).unwrap();
+            assert_eq!(st["iter"], 2);
+            assert_eq!(st["in_flight"], true);
+            // a user turn ends before the tick is delivered → not a tick close
+            notify(());
+            assert_eq!(read_state(sid).unwrap()["in_flight"], true);
+            // REPL drains it; the tick's turn ends with no re-arm → loop over
+            std::fs::remove_file(files[0].path()).unwrap();
+            notify(());
+            let st = read_state(sid).unwrap();
+            assert_eq!(st["status"], "done");
+            assert!(st["notes"].as_str().unwrap().contains("didn't re-arm"));
+            assert!(sched::wakeup(sid, Some(5), "", false).is_err(), "can't re-arm a dead loop");
+        });
+    }
+
+    #[test]
+    fn fixed_interval_arms_without_model_help_and_caps() {
+        with_home("fixed", |_| {
+            let sid = "s-fx";
+            let sess = json!({ "id": sid, "cwd": "/x" });
+            call("command/run", json!({ "name": "/loop", "argv": ["10m", "check", "deploy", "--max", "2"], "session": sess }));
+            let st = read_state(sid).unwrap();
+            assert_eq!(st["interval"], 600);
+            assert_eq!(st["max"], 2);
+            handle(&json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }), None);
+            let st = read_state(sid).unwrap();
+            assert_eq!(st["status"], "running");
+            assert!(st["next_due"].as_u64().unwrap() >= now_secs() + 590);
+            // fire tick 2 by hand (the timer would in 10m), then end it: cap
+            sched::fire(sid, st["gen"].as_u64().unwrap());
+            purge_wakes(sid);
+            handle(&json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }), None);
+            let st = read_state(sid).unwrap();
+            assert_eq!(st["status"], "done");
+            assert!(st["notes"].as_str().unwrap().contains("cap"));
+        });
+    }
+
+    #[test]
+    fn bare_loop_uses_loop_md() {
+        with_home("loopmd", |home| {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(home.join("loop.md"), "- triage new issues\n").unwrap();
+            let r = call("command/run", json!({ "name": "/loop", "argv": [], "session": { "id": "s-md", "cwd": "" } }));
+            assert!(r["result"]["prompt"].as_str().unwrap().contains("triage new issues"));
+        });
+    }
+
+    #[test]
+    fn shutdown_only_purges_its_own_sessions() {
+        with_home("scoped", |home| {
+            let other = home.join("cron").join("inbox").join("someone-else");
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::write(other.join("loop-1.json"), "{}").unwrap();
+            call("command/run", json!({ "name": "/loop", "argv": ["x"], "session": { "id": "mine", "cwd": "/x" } }));
+            shutdown_cleanup();
+            assert!(other.join("loop-1.json").exists());
         });
     }
 }
