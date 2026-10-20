@@ -1,6 +1,6 @@
 [package]
 name = "gray-loop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json = "1"
+gray-questions = { git = "https://github.com/vstaln/gray-questions", tag = "v0.1.1" }
 
 [profile.release]
 strip = true

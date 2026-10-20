@@ -30,19 +30,52 @@ A sidecar plugin for [gray](https://github.com/vstaln/gray), scaffolded by
 
 ## What it does
 
-- `/loop <goal>` — seeds `~/.gray/loop/<session>/state.json`
-  (`{goal, iter, max, status, notes}`) and returns a `{prompt}` putting the
-  agent to work on the goal with instructions to keep `status`/`notes`
-  current at that path.
+- `/loop <goal> [--review] [--gate "<verify cmd>"]` — seeds
+  `~/.gray/loop/<session>/state.json` (`{goal, iter, max, status, notes,
+  tasks[], learnings[], steer[], gate?, gate_run?, review?, review_run?,
+  review_passed?, review_disabled?}`) and returns a `{prompt}` putting the
+  agent to work on the goal.
 - `agent/before_start` hook — while the state reads `running` and
-  `iter < max`, bumps `iter` and appends a "Loop iteration N of \<goal\>:
-  continue … call loop_done when verifiably complete" user message.
-  Counting lives in the hook, so a model that never writes state still
-  terminates at the cap.
-- `loop_done` tool — `{status: "done"|"failed", reason}` ends the loop.
-- `/loop status` — report goal, iter/max, status, notes.
+  `iter < max`, bumps `iter` and appends a continue message carrying the
+  goal, the task checklist, the latest learnings, any queued steering, and
+  the gate reminder. Counting lives in the hook, so a model that never
+  writes state still terminates at the cap.
+- `loop_task` tool — the deterministic exit oracle: `add` a checkable unit,
+  `pass`/`fail` it by 1-based id, exact text, unique prefix, or unique
+  substring. The plugin ends the loop itself once every task passes; a
+  manual `loop_done` is rejected while tasks are unchecked.
+- `--gate "<cmd>"` — a verification command (runs `sh -c` from the session
+  cwd, 180s cap). Once all tasks pass — or a taskless `loop_done` is called
+  — the gate is armed in the background: combined output streams to
+  `gate.out`, the exit code to `gate.code`. Polls (`loop_done`, the next
+  `before_start` iteration) resolve it: exit 0 ends the loop, anything else
+  rejects the "done" with the output tail and the loop keeps going. A
+  running gate is killed on `/loop stop`, `loop_done "failed"`, cap-out, or
+  timeout.
+- `--review` — a second-agent stage ahead of the gate. Once tasks pass (or
+  a taskless `loop_done` lands), a detached `gray -p` child reviews the
+  real state of the work (binary: `$GRAY_LOOP_REVIEW_BIN`, else `$GRAY_BIN`,
+  else `gray` on PATH; 600s cap; output to `review.out`, exit to
+  `review.code`; the child shows up in the Agents view as
+  `loop-review-*`). Its reply must end with one verdict line:
+  `VERDICT: CLEAR` proceeds to the gate; `VERDICT: RESOLVABLE — <fix>`
+  queues the finding as steering and rejects the "done"; `VERDICT: NOVEL —
+  <issue>` escalates to a blocking `host/ask` modal — *send back to work*
+  (optional guidance rides as a note), *ship anyway*, or *stop the loop*.
+  No ask channel → the issue degrades to a steering note and the loop keeps
+  going; a missing `gray` disables review outright. A failed gate clears
+  `review_passed`, so post-gate fixes get re-reviewed.
+- `loop_learn` tool — append a durable learning (last 3 ride every
+  continue prompt; log capped at 50).
+- `loop_done` tool — `{status: "done"|"failed", reason}` ends the loop;
+  with a gate configured, "done" arms/polls it first.
+- `/loop status` — report goal, iter/max, task tally, gate (incl. running),
+  notes.
+- `/loop tasks` — render the checklist.
+- `/loop steer <msg>` — queue a steering message for the next iteration.
 - `/loop stop` — force status `failed`.
 - `/loop max N` — retune the iteration cap (default 10).
+- `/loop list` — every session's loop, globbed from `~/.gray/loop/*/`.
 
 State honors `$GRAY_HOME` first, then `$HOME/.gray`. Everything fails open:
 odd state files, missing sessions, bad args → `{}` or a text note, never a
@@ -51,7 +84,11 @@ crash.
 ## Wire
 
 `command/run` (`/loop`) + `agent/before_start` (hook) + `tool/call`
-(`loop_done`). Protocol `2.0` (mutating hook).
+(`loop_done`, `loop_task`, `loop_learn`). Protocol `2.0` (mutating hook).
+Declares `capabilities: ["host.ask"]` for the human-review step; the ask
+payloads are built with the shared [`gray-questions`
+crate](https://github.com/vstaln/gray-questions) (`git` dep, tag
+`v0.1.1`).
 
 ## Install
 
