@@ -156,7 +156,57 @@ fn set_status(session_id: &str, status: &str, note: &str) -> bool {
     if !note.is_empty() {
         st["notes"] = json!(note);
     }
-    write_state(session_id, &st).is_ok()
+    let ok = write_state(session_id, &st).is_ok();
+    if ok && status != "running" {
+        purge_wakes(session_id);
+    }
+    ok
+}
+
+// ── self-drive: session wake entries ─────────────────────────
+// The host drains `cron/inbox/<sid>/*.json` into prompts (card+prompt
+// fields) and a 2s poller wakes the REPL when files appear. Queuing one
+// entry per turn is what makes the loop actually loop: the queued prompt
+// starts the next turn, whose before_start queues the one after. Files
+// named `loop-*` are ours — purge them on every terminal transition.
+
+fn inbox_dir(sid: &str) -> PathBuf {
+    gray_home().join("cron").join("inbox").join(sid)
+}
+
+fn queue_wake(sid: &str, card: &str, prompt: &str) {
+    if sid.is_empty() {
+        return;
+    }
+    let dir = inbox_dir(sid);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("loop-{nonce}-{}.json", std::process::id());
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let body = json!({ "card": card, "prompt": prompt });
+    if std::fs::write(&tmp, body.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join(name));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn purge_wakes(sid: &str) {
+    if sid.is_empty() {
+        return;
+    }
+    if let Ok(rd) = std::fs::read_dir(inbox_dir(sid)) {
+        for ent in rd.flatten() {
+            if ent.file_name().to_string_lossy().starts_with("loop-") {
+                let _ = std::fs::remove_file(ent.path());
+            }
+        }
+    }
 }
 
 fn session_id(params: &Value) -> String {
@@ -256,11 +306,38 @@ fn gate_tail(sid: &str) -> String {
 fn kill_tree(pid: u64) {
     #[cfg(unix)]
     {
-        let p = pid.to_string();
-        let _ = std::process::Command::new("pkill")
-            .args(["-KILL", "-P", &p])
+        // Setsid children share `pid` as their process-group id, so a group
+        // kill reaps the whole tree even if the leader already exited.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
             .status();
-        let _ = std::process::Command::new("kill").args(["-9", &p]).status();
+        // Fallback: walk the descendant set for non-setsid spawns.
+        let mut pids = vec![pid];
+        let mut i = 0;
+        while i < pids.len() && pids.len() < 128 {
+            let cur = pids[i].to_string();
+            if let Ok(out) = std::process::Command::new("pgrep")
+                .args(["-P", &cur])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Ok(c) = line.trim().parse::<u64>()
+                        && !pids.contains(&c)
+                    {
+                        pids.push(c);
+                    }
+                }
+            }
+            i += 1;
+        }
+        for p in pids.iter().skip(1) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &p.to_string()])
+                .status();
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
     #[cfg(windows)]
     let _ = std::process::Command::new("taskkill")
@@ -279,7 +356,8 @@ fn gate_arm(sid: &str, st: &mut Value, cmd: &str, cwd: &str) -> Result<(), Strin
     let out = std::fs::File::create(&out_p).map_err(|e| format!("gate: {e}"))?;
     let err = out.try_clone().map_err(|e| format!("gate: {e}"))?;
     let _ = std::fs::remove_file(&code_p);
-    let child = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("setsid")
+        .arg("sh")
         .arg("-c")
         .arg("( eval \"$GATE_CMD\" ); printf %s $? > \"$GATE_CODE\"")
         .env("GATE_CMD", cmd)
@@ -289,8 +367,12 @@ fn gate_arm(sid: &str, st: &mut Value, cmd: &str, cwd: &str) -> Result<(), Strin
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
         .spawn()
-        .map_err(|e| format!("couldn't start gate command (needs `sh` on PATH): {e}"))?;
-    st["gate_run"] = json!({ "pid": child.id(), "at": now_secs(), "cmd": cmd });
+        .map_err(|e| format!("couldn't start gate command (needs `setsid`+`sh` on PATH): {e}"))?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    st["gate_run"] = json!({ "pid": pid, "at": now_secs(), "cmd": cmd });
     write_state(sid, st).map_err(|e| format!("gate: state write failed: {e}"))
 }
 
@@ -457,7 +539,8 @@ fn review_arm(sid: &str, st: &mut Value, cwd: &str) -> Result<(), String> {
         .or_else(|| std::env::var("GRAY_BIN").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "gray".into());
     let name = format!("loop-review-{}", &sid[..sid.len().min(8)]);
-    let child = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("setsid")
+        .arg("sh")
         .arg("-c")
         .arg(r#""$LOOP_REVIEW_BIN" -p "$LOOP_REVIEW_PROMPT"; printf %s $? > "$LOOP_REVIEW_CODE""#)
         .env("LOOP_REVIEW_BIN", bin)
@@ -470,7 +553,11 @@ fn review_arm(sid: &str, st: &mut Value, cwd: &str) -> Result<(), String> {
         .stderr(std::process::Stdio::from(err))
         .spawn()
         .map_err(|e| format!("couldn't start reviewer (needs `sh` + `gray` on PATH): {e}"))?;
-    st["review_run"] = json!({ "pid": child.id(), "at": now_secs() });
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    st["review_run"] = json!({ "pid": pid, "at": now_secs() });
     write_state(sid, st).map_err(|e| format!("review: state write failed: {e}"))
 }
 
@@ -623,6 +710,7 @@ fn review_stage(
         ))),
         ReviewPoll::Clear => {
             st["review_passed"] = json!(true);
+            st["review_fails"] = json!(0);
             let _ = write_state(sid, st);
             None
         }
@@ -668,9 +756,31 @@ fn review_stage(
                 )))
             }
         },
-        ReviewPoll::Failed(why) => Some(DoneCheck::Rejected(format!(
-            "reviewer failed ({why}) — \"done\" rejected; a fresh review arms on the next poll"
-        ))),
+        ReviewPoll::Failed(why) => {
+            let fails = st
+                .get("review_fails")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + 1;
+            st["review_fails"] = json!(fails);
+            if fails >= 3 {
+                st["review_disabled"] =
+                    json!(format!("reviewer failed {fails} times in a row ({why})"));
+                push_steer(
+                    st,
+                    format!("second-agent review disabled after {fails} failures: {why}"),
+                );
+                let _ = write_state(sid, st);
+                Some(DoneCheck::Rejected(format!(
+                    "reviewer failed {fails}× in a row ({why}) — review disabled; \"done\" re-arms nothing, call loop_done again to proceed without it"
+                )))
+            } else {
+                let _ = write_state(sid, st);
+                Some(DoneCheck::Rejected(format!(
+                    "reviewer failed ({why}) — \"done\" rejected; a fresh review arms on the next poll"
+                )))
+            }
+        }
     }
 }
 
@@ -762,6 +872,24 @@ fn check_done(sid: &str, cwd: &str, link: Option<&HostLink>) -> DoneCheck {
 /// `/loop <goal>` — seed state, return the kickoff prompt.
 fn start_goal(session_id: &str, goal: &str, gate: Option<&str>, review: bool) -> Value {
     let path = state_path(session_id);
+    // Replacing a running loop: kill its detached gate/reviewer so they
+    // can't go orphaned or write a stale result file into the new run.
+    let mut replaced = false;
+    if let Some(old_st) = read_state(session_id) {
+        if old_st.get("status").and_then(Value::as_str) == Some("running") {
+            replaced = true;
+            for key in ["gate_run", "review_run"] {
+                if let Some(pid) = old_st
+                    .get(key)
+                    .and_then(|g| g.get("pid"))
+                    .and_then(Value::as_u64)
+                {
+                    kill_tree(pid);
+                }
+            }
+        }
+    }
+    purge_wakes(session_id);
     let existing_max = read_state(session_id)
         .and_then(|st| st.get("max").and_then(Value::as_u64))
         .unwrap_or(DEFAULT_MAX);
@@ -794,8 +922,13 @@ fn start_goal(session_id: &str, goal: &str, gate: Option<&str>, review: bool) ->
     } else {
         ""
     };
+    let replaced_line = if replaced {
+        "\n(Note: this replaced a previous loop that was still running — its task list, learnings and counters were reset.)\n"
+    } else {
+        ""
+    };
     json!({ "prompt": format!(
-        "Work on this goal: {goal}\n\n\
+        "{replaced_line}Work on this goal: {goal}\n\n\
          You are inside a /loop — after this turn you will be re-prompted to continue until the goal is\n\
          done or the iteration cap ({existing_max}) is hit.\n\n\
          How this loop works:\n\
@@ -822,7 +955,24 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
     if sid.is_empty() {
         return json!({ "text": "loop: no session id" });
     }
+    // Bare-word subcommands only fire alone — "/loop stop the rollout" is
+    // a goal, not a stop. `max` needs its numeric arg to be one.
     match argv.first().copied() {
+        Some(word) if argv.len() > 1
+            && matches!(word, "stop" | "status" | "tasks" | "list") =>
+        {
+            goal_run(argv, &sid, params)
+        }
+        Some("max")
+            if argv
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .is_none()
+            && argv.len() > 1 =>
+        {
+            goal_run(argv, &sid, params)
+        }
         Some("stop") => {
             if let Some(mut st) = read_state(&sid) {
                 if let Some(pid) = st
@@ -843,7 +993,9 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                 gate_clear(&mut st);
                 st["status"] = json!("failed");
                 st["notes"] = json!("stopped by user via /loop stop");
-                if write_state(&sid, &st).is_ok() {
+                let ok = write_state(&sid, &st).is_ok();
+                purge_wakes(&sid);
+                if ok {
                     return json!({ "text": "loop stopped (status → failed)" });
                 }
             }
@@ -977,42 +1129,52 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                 json!({ "text": format!("loops ({}):\n{}", lines.len(), lines.join("\n")) })
             }
         }
-        Some(goal_word) => {
-            let words: Vec<&str> = std::iter::once(goal_word)
-                .chain(argv.iter().skip(1).copied())
-                .collect();
-            let split = words
-                .iter()
-                .position(|w| *w == "--gate")
-                .unwrap_or(words.len());
-            let gate = (split < words.len())
-                .then(|| words[split + 1..].join(" "))
-                .filter(|g| !g.is_empty());
-            let mut review = false;
-            let goal = words[..split]
-                .iter()
-                .filter(|w| {
-                    if **w == "--review" {
-                        review = true;
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" ");
-            if goal.is_empty() {
-                return json!({ "text": "usage: /loop <goal> [--review] [--gate \"<verify command>\"]" });
-            }
-            start_goal(&sid, &goal, gate.as_deref(), review)
-        }
+        Some(_) => goal_run(argv, &sid, params),
         None => json!({ "text": format!(
             "gray-loop {} — /loop <goal> [--review] [--gate \"cmd\"] runs the goal in self-driving iterations. \
              /loop status · /loop tasks · /loop steer <msg> · /loop stop · /loop max N · /loop list",
             env!("CARGO_PKG_VERSION")
         ) }),
     }
+}
+
+/// `/loop <goal> [--review] [--gate "<cmd>"]` — everything that isn't a
+/// bare subcommand lands here, flags split out of the goal text.
+fn goal_run(argv: &[&str], sid: &str, params: &Value) -> Value {
+    let _ = params;
+    let words: Vec<&str> = argv.to_vec();
+    let split = words
+        .iter()
+        .position(|w| *w == "--gate")
+        .unwrap_or(words.len());
+    let gate = if split < words.len() {
+        match words[split + 1..].join(" ") {
+            g if g.is_empty() => {
+                return json!({ "text": "usage: /loop <goal> [--review] [--gate \"<verify command>\"]" });
+            }
+            g => Some(g),
+        }
+    } else {
+        None
+    };
+    let mut review = false;
+    let goal = words[..split]
+        .iter()
+        .filter(|w| {
+            if **w == "--review" {
+                review = true;
+                false
+            } else {
+                true
+            }
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if goal.is_empty() {
+        return json!({ "text": "usage: /loop <goal> [--review] [--gate \"<verify command>\"]" });
+    }
+    start_goal(sid, &goal, gate.as_deref(), review)
 }
 
 // ── hook + tools ──────────────────────────────────────────────
@@ -1028,6 +1190,7 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
         return json!({});
     };
     if st.get("status").and_then(Value::as_str) != Some("running") {
+        purge_wakes(&sid);
         return json!({});
     }
     let cwd = session_cwd(params);
@@ -1048,6 +1211,7 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
             }
         }
         if st.get("status").and_then(Value::as_str) != Some("running") {
+            purge_wakes(&sid);
             return json!({});
         }
     }
@@ -1068,6 +1232,7 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
                 st["status"] = json!("done");
                 st["notes"] = json!(format!("{basis}; gate `{gate}` green"));
                 let _ = write_state(&sid, &st);
+                purge_wakes(&sid);
                 return json!({});
             }
             GatePoll::Finished(code) => {
@@ -1120,6 +1285,7 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
         st["status"] = json!("failed");
         st["notes"] = json!(format!("iteration cap ({max}) reached"));
         let _ = write_state(&sid, &st);
+        purge_wakes(&sid);
         return json!({});
     }
     st["iter"] = json!(iter + 1);
@@ -1193,7 +1359,22 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
         "Continue with the next unchecked task; mark it with loop_task when it truly passes."
             .to_string()
     });
-    json!({ "text": parts.join("\n") })
+    let text = parts.join("\n");
+    // Queue the next turn: the host drains cron/inbox/<sid> into a fresh
+    // prompt, whose before_start queues the one after — the chain that
+    // makes /loop self-driving. The prompt self-neutralizes if the loop
+    // ended between queue and delivery.
+    let mut wake_parts = parts.clone();
+    wake_parts[0] = format!("Loop iteration {} of {max} — goal: \"{goal}\"", iter + 2);
+    queue_wake(
+        &sid,
+        &format!("loop iteration {} of {max} — {goal}", iter + 2),
+        &format!(
+            "{}\n\n(This is a scheduled /loop nudge — if the loop has ended, reply briefly and take no further action.)",
+            wake_parts.join("\n")
+        ),
+    );
+    json!({ "text": text })
 }
 
 fn call_tool(
