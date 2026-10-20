@@ -800,10 +800,11 @@ fn resolve_done(sid: &str, cwd: &str, basis: &str, link: Option<&HostLink>) -> D
     }
     // Review stage runs before the gate: a second agent judges the work,
     // then the mechanical checks decide.
-    if review_enabled(&st) && !review_passed(&st) {
-        if let Some(verdict) = review_stage(sid, &mut st, cwd, link) {
-            return verdict;
-        }
+    if review_enabled(&st)
+        && !review_passed(&st)
+        && let Some(verdict) = review_stage(sid, &mut st, cwd, link)
+    {
+        return verdict;
     }
     let Some(gate) = st
         .get("gate")
@@ -875,17 +876,17 @@ fn start_goal(session_id: &str, goal: &str, gate: Option<&str>, review: bool) ->
     // Replacing a running loop: kill its detached gate/reviewer so they
     // can't go orphaned or write a stale result file into the new run.
     let mut replaced = false;
-    if let Some(old_st) = read_state(session_id) {
-        if old_st.get("status").and_then(Value::as_str) == Some("running") {
-            replaced = true;
-            for key in ["gate_run", "review_run"] {
-                if let Some(pid) = old_st
-                    .get(key)
-                    .and_then(|g| g.get("pid"))
-                    .and_then(Value::as_u64)
-                {
-                    kill_tree(pid);
-                }
+    if let Some(old_st) = read_state(session_id)
+        && old_st.get("status").and_then(Value::as_str) == Some("running")
+    {
+        replaced = true;
+        for key in ["gate_run", "review_run"] {
+            if let Some(pid) = old_st
+                .get(key)
+                .and_then(|g| g.get("pid"))
+                .and_then(Value::as_u64)
+            {
+                kill_tree(pid);
             }
         }
     }
@@ -1220,9 +1221,7 @@ fn on_turn_end(params: &Value, link: Option<&HostLink>) {
 /// `on_turn_end` can tell this turn was already driven. Returns the continue
 /// text — before_start injects it; turn_end discards it.
 fn iterate(sid: &str, cwd: &str, link: Option<&HostLink>, from_bs: bool) -> Option<String> {
-    let Some(mut st) = read_state(sid) else {
-        return None;
-    };
+    let mut st = read_state(sid)?;
     if st.get("status").and_then(Value::as_str) != Some("running") {
         purge_wakes(sid);
         return None;
@@ -1249,7 +1248,7 @@ fn iterate(sid: &str, cwd: &str, link: Option<&HostLink>, from_bs: bool) -> Opti
         }
     }
     if st.get("gate_run").is_some() {
-        match gate_poll(&sid, &mut st) {
+        match gate_poll(sid, &mut st) {
             GatePoll::Finished(0) => {
                 let ts = tasks(&st);
                 let basis = if ts.is_empty() {
