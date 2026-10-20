@@ -1186,21 +1186,54 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
     if sid.is_empty() {
         return json!({});
     }
-    let Some(mut st) = read_state(&sid) else {
-        return json!({});
+    let cwd = session_cwd(params);
+    match iterate(&sid, &cwd, link, true) {
+        Some(text) => json!({ "text": text }),
+        None => json!({}),
+    }
+}
+
+/// `event/notify` turn_end — fallback drive for hosts that never dispatch
+/// `agent/before_start` (lean prompt mode skips the hook entirely). Skipped
+/// when before_start already advanced this turn (`bs_iter` tag) so the two
+/// channels never double-count an iteration.
+fn on_turn_end(params: &Value, link: Option<&HostLink>) {
+    let sid = session_id(params);
+    if sid.is_empty() {
+        return;
+    }
+    let Some(st) = read_state(&sid) else {
+        return;
     };
     if st.get("status").and_then(Value::as_str) != Some("running") {
-        purge_wakes(&sid);
-        return json!({});
+        return;
+    }
+    if st.get("iter") == st.get("bs_iter") {
+        return;
     }
     let cwd = session_cwd(params);
+    let _ = iterate(&sid, &cwd, link, false);
+}
+
+/// Shared iteration advance: poll review + gate, enforce the cap, bump iter,
+/// queue the wake entry for the next turn. `from_bs` tags the bump so
+/// `on_turn_end` can tell this turn was already driven. Returns the continue
+/// text — before_start injects it; turn_end discards it.
+fn iterate(sid: &str, cwd: &str, link: Option<&HostLink>, from_bs: bool) -> Option<String> {
+    let Some(mut st) = read_state(sid) else {
+        return None;
+    };
+    if st.get("status").and_then(Value::as_str) != Some("running") {
+        purge_wakes(sid);
+        return None;
+    }
     let mut gate_note: Option<String> = None;
     // Review stage: poll the detached second agent; a NOVEL verdict can
     // block here on `host/ask` for the human-review step.
     if st.get("review_run").is_some() {
-        match review_stage(&sid, &mut st, &cwd, link) {
+        match review_stage(sid, &mut st, cwd, link) {
             Some(DoneCheck::Verifying(m)) | Some(DoneCheck::Rejected(m)) => gate_note = Some(m),
-            Some(DoneCheck::Complete(_)) => return json!({}),
+            Some(DoneCheck::Complete(_)) => return None,
             Some(DoneCheck::Open) | None => {
                 if review_passed(&st) {
                     gate_note = Some(
@@ -1211,8 +1244,8 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
             }
         }
         if st.get("status").and_then(Value::as_str) != Some("running") {
-            purge_wakes(&sid);
-            return json!({});
+            purge_wakes(sid);
+            return None;
         }
     }
     if st.get("gate_run").is_some() {
@@ -1231,9 +1264,9 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
                     .to_string();
                 st["status"] = json!("done");
                 st["notes"] = json!(format!("{basis}; gate `{gate}` green"));
-                let _ = write_state(&sid, &st);
-                purge_wakes(&sid);
-                return json!({});
+                let _ = write_state(sid, &st);
+                purge_wakes(sid);
+                return None;
             }
             GatePoll::Finished(code) => {
                 unpass_review(&mut st);
@@ -1244,14 +1277,14 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
                 };
                 gate_note = Some(format!(
                     "Gate FAILED ({why}) — \"done\" was rejected, keep working. Output tail:\n{}",
-                    gate_tail(&sid)
+                    gate_tail(sid)
                 ));
             }
             GatePoll::TimedOut(secs) => {
                 unpass_review(&mut st);
                 gate_note = Some(format!(
                     "Gate TIMED OUT after {secs}s — \"done\" was rejected, keep working. Output tail:\n{}",
-                    gate_tail(&sid)
+                    gate_tail(sid)
                 ));
             }
             GatePoll::Running(secs) => {
@@ -1263,7 +1296,7 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
         }
     }
     if st.get("status").and_then(Value::as_str) != Some("running") {
-        return json!({});
+        return None;
     }
     let iter = st.get("iter").and_then(Value::as_u64).unwrap_or(0);
     let max = st.get("max").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX);
@@ -1284,11 +1317,14 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
         }
         st["status"] = json!("failed");
         st["notes"] = json!(format!("iteration cap ({max}) reached"));
-        let _ = write_state(&sid, &st);
-        purge_wakes(&sid);
-        return json!({});
+        let _ = write_state(sid, &st);
+        purge_wakes(sid);
+        return None;
     }
     st["iter"] = json!(iter + 1);
+    if from_bs {
+        st["bs_iter"] = json!(iter + 1);
+    }
     let steer: Vec<String> = st
         .get("steer")
         .and_then(Value::as_array)
@@ -1302,8 +1338,8 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
     if !steer.is_empty() {
         st["steer"] = json!([]);
     }
-    if write_state(&sid, &st).is_err() {
-        return json!({});
+    if write_state(sid, &st).is_err() {
+        return None;
     }
     let goal = st.get("goal").and_then(Value::as_str).unwrap_or("?");
     let mut parts = vec![format!(
@@ -1365,16 +1401,17 @@ fn before_start(params: &Value, link: Option<&HostLink>) -> Value {
     // makes /loop self-driving. The prompt self-neutralizes if the loop
     // ended between queue and delivery.
     let mut wake_parts = parts.clone();
-    wake_parts[0] = format!("Loop iteration {} of {max} — goal: \"{goal}\"", iter + 2);
+    let next_label = if from_bs { iter + 2 } else { iter + 1 };
+    wake_parts[0] = format!("Loop iteration {} of {max} — goal: \"{goal}\"", next_label);
     queue_wake(
-        &sid,
-        &format!("loop iteration {} of {max} — {goal}", iter + 2),
+        sid,
+        &format!("loop iteration {} of {max} — {goal}", next_label),
         &format!(
             "{}\n\n(This is a scheduled /loop nudge — if the loop has ended, reply briefly and take no further action.)",
             wake_parts.join("\n")
         ),
     );
-    json!({ "text": text })
+    Some(text)
 }
 
 fn call_tool(
@@ -1566,6 +1603,37 @@ fn call_tool(
     }
 }
 
+fn shutdown_cleanup() {
+    if let Ok(rd) = std::fs::read_dir(gray_home().join("loop")) {
+        for ent in rd.flatten() {
+            if let Ok(text) = std::fs::read_to_string(ent.path().join("state.json"))
+                && let Ok(st) = serde_json::from_str::<Value>(&text)
+            {
+                for key in ["gate_run", "review_run"] {
+                    if let Some(pid) = st
+                        .get(key)
+                        .and_then(|g| g.get("pid"))
+                        .and_then(Value::as_u64)
+                    {
+                        kill_tree(pid);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(gray_home().join("cron").join("inbox")) {
+        for ent in rd.flatten() {
+            if let Ok(rd2) = std::fs::read_dir(ent.path()) {
+                for f in rd2.flatten() {
+                    if f.file_name().to_string_lossy().starts_with("loop-") {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── wire ──────────────────────────────────────────────────────
 
 fn handle(req: &Value, link: Option<&HostLink>) -> (Option<Value>, bool) {
@@ -1573,7 +1641,21 @@ fn handle(req: &Value, link: Option<&HostLink>) -> (Option<Value>, bool) {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let Some(id) = id else {
-        return (None, method == "plugin/shutdown");
+        // Notifications (no id): turn_end is the lean-mode loop drive;
+        // plugin/shutdown cleans up detached children before exit.
+        match method {
+            "event/notify"
+                if params.get("type").and_then(Value::as_str) == Some("turn_end") =>
+            {
+                on_turn_end(&params, link);
+            }
+            "plugin/shutdown" => {
+                shutdown_cleanup();
+                return (None, true);
+            }
+            _ => {}
+        }
+        return (None, false);
     };
     let result = match method {
         "plugin/manifest" => manifest(),
