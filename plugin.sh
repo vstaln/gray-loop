@@ -15,7 +15,7 @@ Darwin*)
     esac ;;
 esac
 if [ -x "$here/$rel" ]; then exec "$here/$rel" "$@"; fi
-for cand in "$here/target/release/gray-loop.exe" "$here/target/release/gray-loop" "$here/target/debug/gray-loop.exe" "$here/target/debug/gray-loop"; do
+for cand in "$here/gray-loop.exe" "$here/gray-loop" "$here/target/release/gray-loop.exe" "$here/target/release/gray-loop" "$here/target/debug/gray-loop.exe" "$here/target/debug/gray-loop"; do
     if [ -x "$cand" ]; then exec "$cand" "$@"; fi
 done
 echo "gray-loop binary not found in $here" >&2
