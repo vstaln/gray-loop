@@ -370,17 +370,20 @@ fn gate_clear(st: &mut Value) {
 }
 
 /// A Command that runs `script` under a POSIX shell. On unix it goes through
-/// `setsid` so the child is its own process-group leader and `kill_tree` can
-/// reap the whole tree. Elsewhere a bare `sh` (Git Bash on Windows) still
-/// works; `kill_tree` falls back to taskkill /T there.
+/// `setsid` (Linux only — it doesn't exist on macOS/Windows) so the child is
+/// its own process-group leader and `kill_tree` can reap the whole tree.
+/// Elsewhere a bare `sh` (Git Bash on Windows) still runs the script.
 fn sh_cmd(script: &str) -> std::process::Command {
-    #[cfg(unix)]
+    // setsid is a Linux (util-linux) tool — it does not exist on macOS or
+    // Windows. There a bare `sh` (Git Bash on Windows) still runs the script;
+    // kill_tree falls back to the descendant walk / taskkill /T.
+    #[cfg(target_os = "linux")]
     {
         let mut c = std::process::Command::new("setsid");
         c.arg("sh").arg("-c").arg(script);
         c
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let mut c = std::process::Command::new("sh");
         c.arg("-c").arg(script);
@@ -2065,7 +2068,7 @@ mod tests {
     /// Env vars are process-global; tests touching them must serialize.
     fn with_home<T>(tag: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("grayloop-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         unsafe { std::env::set_var("GRAY_HOME", &home) };
