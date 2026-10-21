@@ -101,11 +101,19 @@ pub(crate) fn fmt_dur(secs: u64) -> String {
         0 => "now".into(),
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => {
-            if s % 60 == 0 { format!("{}m", s / 60) } else { format!("{}m{}s", s / 60, s % 60) }
+            if s % 60 == 0 {
+                format!("{}m", s / 60)
+            } else {
+                format!("{}m{}s", s / 60, s % 60)
+            }
         }
         s if s < 86_400 => {
             let m = (s % 3600) / 60;
-            if m == 0 { format!("{}h", s / 3600) } else { format!("{}h{m}m", s / 3600) }
+            if m == 0 {
+                format!("{}h", s / 3600)
+            } else {
+                format!("{}h{m}m", s / 3600)
+            }
         }
         s => format!("{}d", s / 86_400),
     }
@@ -127,7 +135,10 @@ fn loop_md(cwd: &str) -> Option<(String, PathBuf)> {
                     cut -= 1;
                 }
                 let cut = t[..cut].rfind('\n').unwrap_or(cut);
-                format!("{}\n> WARNING: loop.md was truncated to {LOOP_MD_CAP} bytes.", &t[..cut])
+                format!(
+                    "{}\n> WARNING: loop.md was truncated to {LOOP_MD_CAP} bytes.",
+                    &t[..cut]
+                )
             } else {
                 t
             };
@@ -147,7 +158,10 @@ pub(crate) fn start(argv: &[&str], sid: &str, cwd: &str) -> Option<Value> {
     let mut i = 0;
     while i < argv.len() {
         if argv[i] == "--max"
-            && let Some(n) = argv.get(i + 1).and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0)
+            && let Some(n) = argv
+                .get(i + 1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| *n > 0)
         {
             max = n;
             i += 2;
@@ -193,12 +207,18 @@ pub(crate) fn start(argv: &[&str], sid: &str, cwd: &str) -> Option<Value> {
 
 /// End whatever loop is running for `sid` (any mode) before a new start.
 fn retire(sid: &str) -> bool {
-    let Some(old) = read_state(sid) else { return false };
+    let Some(old) = read_state(sid) else {
+        return false;
+    };
     if old.get("status").and_then(Value::as_str) != Some("running") {
         return false;
     }
     for key in ["gate_run", "review_run"] {
-        if let Some(pid) = old.get(key).and_then(|g| g.get("pid")).and_then(Value::as_u64) {
+        if let Some(pid) = old
+            .get(key)
+            .and_then(|g| g.get("pid"))
+            .and_then(Value::as_u64)
+        {
             kill_tree(pid);
         }
     }
@@ -224,7 +244,10 @@ pub(crate) fn tick_prompt(st: &Value, steer: &[String]) -> String {
     }
     out.push_str(prompt.trim());
     if !steer.is_empty() {
-        out.push_str(&format!("\n\nSteering from the user for this tick: {}", steer.join(" | ")));
+        out.push_str(&format!(
+            "\n\nSteering from the user for this tick: {}",
+            steer.join(" | ")
+        ));
     }
     out.push_str("\n\n---\n");
     match st.get("interval").and_then(Value::as_u64) {
@@ -250,7 +273,9 @@ pub(crate) fn tick_prompt(st: &Value, steer: &[String]) -> String {
 
 pub(crate) fn on_turn_end(sid: &str, link: Option<&HostLink>) {
     let guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(mut st) = read_state(sid) else { return };
+    let Some(mut st) = read_state(sid) else {
+        return;
+    };
     if !is_sched(&st) || st.get("status").and_then(Value::as_str) != Some("running") {
         return;
     }
@@ -276,23 +301,52 @@ pub(crate) fn on_turn_end(sid: &str, link: Option<&HostLink>) {
         Some(i) => (i, String::new()),
         None => match &wake {
             Some(w) => (
-                w.get("delay").and_then(Value::as_u64).unwrap_or(0).min(MAX_WAKE),
-                w.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
+                w.get("delay")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(MAX_WAKE),
+                w.get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             ),
             None => {
-                finish(sid, &mut st, &format!("tick {iter} didn't re-arm — loop ended"));
-                say(link, &format!("/loop ended after tick {iter}: the agent didn't re-arm it (`{} wakeup`). Start again with /loop.", cli()));
+                finish(
+                    sid,
+                    &mut st,
+                    &format!("tick {iter} didn't re-arm — loop ended"),
+                );
+                say(
+                    link,
+                    &format!(
+                        "/loop ended after tick {iter}: the agent didn't re-arm it (`{} wakeup`). Start again with /loop.",
+                        cli()
+                    ),
+                );
                 return;
             }
         },
     };
     if iter >= max {
         finish(sid, &mut st, &format!("tick cap ({max}) reached"));
-        say(link, &format!("/loop ended: tick cap {max} reached (raise it with /loop max N and start again)."));
+        say(
+            link,
+            &format!(
+                "/loop ended: tick cap {max} reached (raise it with /loop max N and start again)."
+            ),
+        );
         return;
     }
-    let noop = wake.as_ref().and_then(|w| w.get("noop")).and_then(Value::as_bool) == Some(true);
-    let streak = if noop { st.get("noop_streak").and_then(Value::as_u64).unwrap_or(0) + 1 } else { 0 };
+    let noop = wake
+        .as_ref()
+        .and_then(|w| w.get("noop"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let streak = if noop {
+        st.get("noop_streak").and_then(Value::as_u64).unwrap_or(0) + 1
+    } else {
+        0
+    };
     let epoch = st.get("gen").and_then(Value::as_u64).unwrap_or(0) + 1;
     let due = now_secs() + delay;
     st["noop_streak"] = json!(streak);
@@ -305,8 +359,19 @@ pub(crate) fn on_turn_end(sid: &str, link: Option<&HostLink>) {
     drop(guard);
     arm(sid.to_string(), epoch, due);
     if delay > 0 && streak < 2 {
-        let why = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-        say(link, &format!("/loop: tick {} in {}{why}  (/loop stop to end)", iter + 1, fmt_dur(delay)));
+        let why = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" — {reason}")
+        };
+        say(
+            link,
+            &format!(
+                "/loop: tick {} in {}{why}  (/loop stop to end)",
+                iter + 1,
+                fmt_dur(delay)
+            ),
+        );
     }
 }
 
@@ -367,7 +432,9 @@ fn arm(sid: String, epoch: u64, due: u64) {
 
 pub(crate) fn fire(sid: &str, epoch: u64) {
     let _g = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(mut st) = read_state(sid) else { return };
+    let Some(mut st) = read_state(sid) else {
+        return;
+    };
     if !is_sched(&st)
         || st.get("status").and_then(Value::as_str) != Some("running")
         || st.get("gen").and_then(Value::as_u64) != Some(epoch)
@@ -380,7 +447,12 @@ pub(crate) fn fire(sid: &str, epoch: u64) {
     let steer: Vec<String> = st
         .get("steer")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     st["steer"] = json!([]);
     let prompt = tick_prompt(&st, &steer);
@@ -395,7 +467,11 @@ pub(crate) fn fire(sid: &str, epoch: u64) {
         .take(80)
         .collect();
     let max = st.get("max").and_then(Value::as_u64).unwrap_or(SCHED_MAX);
-    let Some(file) = queue_wake(sid, &format!("/loop tick {iter} of {max} — {label}"), &prompt) else {
+    let Some(file) = queue_wake(
+        sid,
+        &format!("/loop tick {iter} of {max} — {label}"),
+        &prompt,
+    ) else {
         return;
     };
     st["in_flight"] = json!(true);
@@ -408,7 +484,12 @@ pub(crate) fn fire(sid: &str, epoch: u64) {
 
 // ── control: wakeup / stop (CLI + tool) ──────────────────────
 
-pub(crate) fn wakeup(sid: &str, delay: Option<u64>, reason: &str, noop: bool) -> Result<String, String> {
+pub(crate) fn wakeup(
+    sid: &str,
+    delay: Option<u64>,
+    reason: &str,
+    noop: bool,
+) -> Result<String, String> {
     let _g = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut st) = read_state(sid) else {
         return Err(format!("no /loop in session {sid}"));
@@ -420,7 +501,10 @@ pub(crate) fn wakeup(sid: &str, delay: Option<u64>, reason: &str, noop: bool) ->
         return Err("this is a goal loop (/loop goal) — it re-prompts on its own; use `done`/`task` instead".into());
     }
     if let Some(i) = st.get("interval").and_then(Value::as_u64) {
-        return Ok(format!("this loop is recurring every {} — the next tick is automatic, nothing to arm", fmt_dur(i)));
+        return Ok(format!(
+            "this loop is recurring every {} — the next tick is automatic, nothing to arm",
+            fmt_dur(i)
+        ));
     }
     let Some(delay) = delay else {
         return Err("usage: wakeup <seconds> [--reason \"why\"] [--noop]".into());
@@ -428,11 +512,18 @@ pub(crate) fn wakeup(sid: &str, delay: Option<u64>, reason: &str, noop: bool) ->
     let clamped = delay.min(MAX_WAKE);
     st["wake"] = json!({ "delay": clamped, "reason": reason, "noop": noop, "at": now_secs() });
     write_state(sid, &st).map_err(|e| format!("couldn't write state: {e}"))?;
-    let note = if clamped != delay { format!(" (clamped from {delay}s to the {MAX_WAKE}s max)") } else { String::new() };
+    let note = if clamped != delay {
+        format!(" (clamped from {delay}s to the {MAX_WAKE}s max)")
+    } else {
+        String::new()
+    };
     Ok(if clamped == 0 {
         format!("armed: the next tick starts right after this turn ends{note}")
     } else {
-        format!("armed: next tick {} after this turn ends{note}", fmt_dur(clamped))
+        format!(
+            "armed: next tick {} after this turn ends{note}",
+            fmt_dur(clamped)
+        )
     })
 }
 
@@ -450,7 +541,10 @@ pub(crate) fn status_line(st: &Value) -> String {
                 .filter(|r| !r.is_empty())
                 .map(|r| format!(" ({r})"))
                 .unwrap_or_default();
-            format!("\nnext tick in {}{why}", fmt_dur(d.saturating_sub(now_secs())))
+            format!(
+                "\nnext tick in {}{why}",
+                fmt_dur(d.saturating_sub(now_secs()))
+            )
         }
         ("running", None) => "\ntick in progress".into(),
         _ => String::new(),
@@ -459,7 +553,12 @@ pub(crate) fn status_line(st: &Value) -> String {
         "loop {status} — {pace} — tick {}/{}{next}\nprompt: {}\nnotes: {}",
         st.get("iter").and_then(Value::as_u64).unwrap_or(0),
         st.get("max").and_then(Value::as_u64).unwrap_or(SCHED_MAX),
-        st.get("prompt").and_then(Value::as_str).unwrap_or("?").lines().next().unwrap_or(""),
+        st.get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .lines()
+            .next()
+            .unwrap_or(""),
         st.get("notes").and_then(Value::as_str).unwrap_or(""),
     )
 }

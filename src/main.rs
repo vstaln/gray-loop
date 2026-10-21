@@ -135,6 +135,7 @@ fn gray_home() -> PathBuf {
     std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| PathBuf::from(".gray"))
 }
 
@@ -368,15 +369,31 @@ fn gate_clear(st: &mut Value) {
     st.as_object_mut().map(|o| o.remove("gate_run"));
 }
 
+/// A Command that runs `script` under a POSIX shell. On unix it goes through
+/// `setsid` so the child is its own process-group leader and `kill_tree` can
+/// reap the whole tree. Elsewhere a bare `sh` (Git Bash on Windows) still
+/// works; `kill_tree` falls back to taskkill /T there.
+fn sh_cmd(script: &str) -> std::process::Command {
+    #[cfg(unix)]
+    {
+        let mut c = std::process::Command::new("setsid");
+        c.arg("sh").arg("-c").arg(script);
+        c
+    }
+    #[cfg(not(unix))]
+    {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(script);
+        c
+    }
+}
+
 fn gate_arm(sid: &str, st: &mut Value, cmd: &str, cwd: &str) -> Result<(), String> {
     let (out_p, code_p) = gate_files(sid);
     let out = std::fs::File::create(&out_p).map_err(|e| format!("gate: {e}"))?;
     let err = out.try_clone().map_err(|e| format!("gate: {e}"))?;
     let _ = std::fs::remove_file(&code_p);
-    let mut child = std::process::Command::new("setsid")
-        .arg("sh")
-        .arg("-c")
-        .arg("( eval \"$GATE_CMD\" ); printf %s $? > \"$GATE_CODE\"")
+    let mut child = sh_cmd("( eval \"$GATE_CMD\" ); printf %s $? > \"$GATE_CODE\"")
         .env("GATE_CMD", cmd)
         .env("GATE_CODE", &code_p)
         .current_dir(cwd)
@@ -384,7 +401,7 @@ fn gate_arm(sid: &str, st: &mut Value, cmd: &str, cwd: &str) -> Result<(), Strin
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
         .spawn()
-        .map_err(|e| format!("couldn't start gate command (needs `setsid`+`sh` on PATH): {e}"))?;
+        .map_err(|e| format!("couldn't start gate command (needs `sh` on PATH): {e}"))?;
     let pid = child.id();
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -556,20 +573,19 @@ fn review_arm(sid: &str, st: &mut Value, cwd: &str) -> Result<(), String> {
         .or_else(|| std::env::var("GRAY_BIN").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "gray".into());
     let name = format!("loop-review-{}", &sid[..sid.len().min(8)]);
-    let mut child = std::process::Command::new("setsid")
-        .arg("sh")
-        .arg("-c")
-        .arg(r#""$LOOP_REVIEW_BIN" -p "$LOOP_REVIEW_PROMPT"; printf %s $? > "$LOOP_REVIEW_CODE""#)
-        .env("LOOP_REVIEW_BIN", bin)
-        .env("LOOP_REVIEW_PROMPT", review_prompt(st))
-        .env("LOOP_REVIEW_CODE", &code_p)
-        .env("GRAY_AGENT_NAME", name)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(out))
-        .stderr(std::process::Stdio::from(err))
-        .spawn()
-        .map_err(|e| format!("couldn't start reviewer (needs `sh` + `gray` on PATH): {e}"))?;
+    let mut child = sh_cmd(
+        r#""$LOOP_REVIEW_BIN" -p "$LOOP_REVIEW_PROMPT"; printf %s $? > "$LOOP_REVIEW_CODE""#,
+    )
+    .env("LOOP_REVIEW_BIN", bin)
+    .env("LOOP_REVIEW_PROMPT", review_prompt(st))
+    .env("LOOP_REVIEW_CODE", &code_p)
+    .env("GRAY_AGENT_NAME", name)
+    .current_dir(cwd)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::from(out))
+    .stderr(std::process::Stdio::from(err))
+    .spawn()
+    .map_err(|e| format!("couldn't start reviewer (needs `sh` + `gray` on PATH): {e}"))?;
     let pid = child.id();
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -1016,9 +1032,7 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
     // Bare-word subcommands only fire alone — "/loop stop the rollout" is
     // a goal, not a stop. `max` needs its numeric arg to be one.
     match argv.first().copied() {
-        Some(word) if argv.len() > 1
-            && matches!(word, "stop" | "status" | "tasks" | "list") =>
-        {
+        Some(word) if argv.len() > 1 && matches!(word, "stop" | "status" | "tasks" | "list") => {
             goal_run(argv, &sid, params)
         }
         Some("max")
@@ -1027,7 +1041,7 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                 .and_then(|s| s.parse::<u64>().ok())
                 .filter(|n| *n > 0)
                 .is_none()
-            && argv.len() > 1 =>
+                && argv.len() > 1 =>
         {
             goal_run(argv, &sid, params)
         }
@@ -1050,7 +1064,11 @@ fn run_command(argv: &[&str], params: &Value) -> Value {
                 st.as_object_mut().map(|o| o.remove("review_run"));
                 gate_clear(&mut st);
                 let was = st.get("status").and_then(Value::as_str) == Some("running");
-                st["status"] = json!(if sched::is_sched(&st) { "stopped" } else { "failed" });
+                st["status"] = json!(if sched::is_sched(&st) {
+                    "stopped"
+                } else {
+                    "failed"
+                });
                 st["notes"] = json!("stopped by user via /loop stop");
                 if !was {
                     purge_wakes(&sid);
@@ -1509,7 +1527,10 @@ fn call_tool(
     match name {
         "loop_wakeup" => {
             if args.get("stop").and_then(Value::as_bool) == Some(true) {
-                return cli_stop(&sid, args.get("reason").and_then(Value::as_str).unwrap_or(""));
+                return cli_stop(
+                    &sid,
+                    args.get("reason").and_then(Value::as_str).unwrap_or(""),
+                );
             }
             sched::wakeup(
                 &sid,
@@ -1761,9 +1782,7 @@ fn handle(req: &Value, link: Option<&HostLink>) -> (Option<Value>, bool) {
         // Notifications (no id): turn_end is the lean-mode loop drive;
         // plugin/shutdown cleans up detached children before exit.
         match method {
-            "event/notify"
-                if params.get("type").and_then(Value::as_str) == Some("turn_end") =>
-            {
+            "event/notify" if params.get("type").and_then(Value::as_str) == Some("turn_end") => {
                 on_turn_end(&params, link);
             }
             "plugin/shutdown" => {
@@ -1814,7 +1833,11 @@ fn cli_stop(sid: &str, reason: &str) -> Result<String, String> {
         return Ok("the loop had already ended".into());
     }
     for key in ["gate_run", "review_run"] {
-        if let Some(pid) = st.get(key).and_then(|g| g.get("pid")).and_then(Value::as_u64) {
+        if let Some(pid) = st
+            .get(key)
+            .and_then(|g| g.get("pid"))
+            .and_then(Value::as_u64)
+        {
             kill_tree(pid);
         }
     }
@@ -1822,7 +1845,11 @@ fn cli_stop(sid: &str, reason: &str) -> Result<String, String> {
     gate_clear(&mut st);
     let sched = sched::is_sched(&st);
     st["status"] = json!(if sched { "done" } else { "failed" });
-    st["notes"] = json!(if reason.is_empty() { "stopped by the agent".to_string() } else { reason.to_string() });
+    st["notes"] = json!(if reason.is_empty() {
+        "stopped by the agent".to_string()
+    } else {
+        reason.to_string()
+    });
     write_state(sid, &st).map_err(|e| format!("couldn't write state: {e}"))?;
     purge_wakes(sid);
     Ok("loop ended — no more ticks will run".into())
@@ -1861,10 +1888,14 @@ fn cli(args: &[String]) -> i32 {
         return 0;
     }
     if sid.is_empty() {
-        eprintln!("gray loop: no session — run this from a gray bash tool call, or pass --session ID");
+        eprintln!(
+            "gray loop: no session — run this from a gray bash tool call, or pass --session ID"
+        );
         return 2;
     }
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let params = json!({ "session": { "id": sid, "cwd": cwd } });
     let tail = || rest[1..].join(" ");
     let res: Result<String, String> = match verb.as_str() {
@@ -1881,7 +1912,9 @@ fn cli(args: &[String]) -> i32 {
                         i += 1;
                     }
                     w => {
-                        if delay.is_none() && let Ok(n) = w.trim_end_matches('s').parse::<u64>() {
+                        if delay.is_none()
+                            && let Ok(n) = w.trim_end_matches('s').parse::<u64>()
+                        {
                             delay = Some(n);
                         } else if reason.is_empty() {
                             reason = w.to_string();
@@ -1900,7 +1933,10 @@ fn cli(args: &[String]) -> i32 {
                 if sched::is_sched(&st) {
                     sched::status_line(&st)
                 } else {
-                    run_command(&["status"], &params)["text"].as_str().unwrap_or("").to_string()
+                    run_command(&["status"], &params)["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
                 }
             })
             .ok_or_else(|| format!("no /loop in session {sid}")),
@@ -1937,8 +1973,21 @@ fn cli(args: &[String]) -> i32 {
 }
 
 const CLI_VERBS: &[&str] = &[
-    "wakeup", "wake", "next", "stop", "end", "status", "done", "fail", "failed", "task", "learn",
-    "help", "--help", "-h", "--session",
+    "wakeup",
+    "wake",
+    "next",
+    "stop",
+    "end",
+    "status",
+    "done",
+    "fail",
+    "failed",
+    "task",
+    "learn",
+    "help",
+    "--help",
+    "-h",
+    "--session",
 ];
 
 fn main() -> std::io::Result<()> {
@@ -2219,6 +2268,7 @@ VERDICT: CLEAR"
     }
 
     /// A stub `gray` binary that prints a fixed verdict line.
+    #[cfg(unix)]
     fn stub_reviewer(home: &std::path::Path, verdict_line: &str) {
         std::fs::create_dir_all(home).unwrap();
         let sh = home.join("reviewer.sh");
@@ -2240,6 +2290,7 @@ echo '{verdict_line}'
         unsafe { std::env::set_var("GRAY_LOOP_REVIEW_BIN", &sh) };
     }
 
+    #[cfg(unix)]
     fn wait_for(path: &std::path::Path) -> bool {
         for _ in 0..100 {
             if path.exists() {
@@ -2250,6 +2301,7 @@ echo '{verdict_line}'
         false
     }
 
+    #[cfg(unix)]
     #[test]
     fn review_clear_then_done() {
         with_home("rclear", |home| {
@@ -2280,6 +2332,7 @@ echo '{verdict_line}'
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolvable_rejects_and_steers() {
         with_home("rres", |home| {
@@ -2316,6 +2369,7 @@ echo '{verdict_line}'
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn novel_without_ask_channel_rejects() {
         with_home("rnov", |home| {
@@ -2344,26 +2398,52 @@ echo '{verdict_line}'
     #[test]
     fn interval_parsing_matches_claude_code() {
         let p = |s: &str| sched::parse_interval(&s.split_whitespace().collect::<Vec<_>>());
-        assert_eq!(p("5m check the deploy"), (Some(300), "check the deploy".into()));
-        assert_eq!(p("check the deploy every 20m"), (Some(1200), "check the deploy".into()));
-        assert_eq!(p("check the deploy every 2 hours"), (Some(7200), "check the deploy".into()));
+        assert_eq!(
+            p("5m check the deploy"),
+            (Some(300), "check the deploy".into())
+        );
+        assert_eq!(
+            p("check the deploy every 20m"),
+            (Some(1200), "check the deploy".into())
+        );
+        assert_eq!(
+            p("check the deploy every 2 hours"),
+            (Some(7200), "check the deploy".into())
+        );
         assert_eq!(p("check every PR"), (None, "check every PR".into()));
         assert_eq!(p("fix the tests"), (None, "fix the tests".into()));
-        assert_eq!(p("5x is not an interval"), (None, "5x is not an interval".into()));
+        assert_eq!(
+            p("5x is not an interval"),
+            (None, "5x is not an interval".into())
+        );
     }
 
     #[test]
     fn plain_loop_prompt_is_schedule_mode_and_control_words_still_work() {
         with_home("schedroute", |_| {
             let sess = json!({ "id": "s-sr", "cwd": "/x" });
-            let r = call("command/run", json!({ "name": "/loop", "argv": ["stop", "the", "rollout"], "session": sess }));
-            assert!(r["result"]["prompt"].as_str().unwrap().contains("stop the rollout"));
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["stop", "the", "rollout"], "session": sess }),
+            );
+            assert!(
+                r["result"]["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stop the rollout")
+            );
             let st = read_state("s-sr").unwrap();
             assert_eq!(st["mode"], "schedule");
             assert_eq!(st["interval"], Value::Null);
-            let r = call("command/run", json!({ "name": "/loop", "argv": ["status"], "session": sess }));
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["status"], "session": sess }),
+            );
             assert!(r["result"]["text"].as_str().unwrap().contains("self-paced"));
-            let r = call("command/run", json!({ "name": "/loop", "argv": ["stop"], "session": sess }));
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["stop"], "session": sess }),
+            );
             assert_eq!(r["result"]["text"], "loop stopped");
             assert_eq!(read_state("s-sr").unwrap()["status"], "stopped");
         });
@@ -2375,17 +2455,28 @@ echo '{verdict_line}'
             let sid = "s-sp";
             let sess = json!({ "id": sid, "cwd": "/x" });
             let notify = |_: ()| {
-                handle(&json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }), None);
+                handle(
+                    &json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }),
+                    None,
+                );
             };
-            call("command/run", json!({ "name": "/loop", "argv": ["poll", "ci"], "session": sess }));
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["poll", "ci"], "session": sess }),
+            );
             // tick 1 re-arms with 0 → tick 2 queued in the inbox at once
-            assert!(sched::wakeup(sid, Some(0), "active", false).unwrap().contains("right after"));
+            assert!(
+                sched::wakeup(sid, Some(0), "active", false)
+                    .unwrap()
+                    .contains("right after")
+            );
             notify(());
             std::thread::sleep(Duration::from_millis(300));
             let inbox = home.join("cron").join("inbox").join(sid);
             let files: Vec<_> = std::fs::read_dir(&inbox).unwrap().flatten().collect();
             assert_eq!(files.len(), 1, "tick 2 queued");
-            let body: Value = serde_json::from_str(&std::fs::read_to_string(files[0].path()).unwrap()).unwrap();
+            let body: Value =
+                serde_json::from_str(&std::fs::read_to_string(files[0].path()).unwrap()).unwrap();
             assert!(body["prompt"].as_str().unwrap().contains("tick 2"));
             let st = read_state(sid).unwrap();
             assert_eq!(st["iter"], 2);
@@ -2399,7 +2490,10 @@ echo '{verdict_line}'
             let st = read_state(sid).unwrap();
             assert_eq!(st["status"], "done");
             assert!(st["notes"].as_str().unwrap().contains("didn't re-arm"));
-            assert!(sched::wakeup(sid, Some(5), "", false).is_err(), "can't re-arm a dead loop");
+            assert!(
+                sched::wakeup(sid, Some(5), "", false).is_err(),
+                "can't re-arm a dead loop"
+            );
         });
     }
 
@@ -2408,18 +2502,27 @@ echo '{verdict_line}'
         with_home("fixed", |_| {
             let sid = "s-fx";
             let sess = json!({ "id": sid, "cwd": "/x" });
-            call("command/run", json!({ "name": "/loop", "argv": ["10m", "check", "deploy", "--max", "2"], "session": sess }));
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["10m", "check", "deploy", "--max", "2"], "session": sess }),
+            );
             let st = read_state(sid).unwrap();
             assert_eq!(st["interval"], 600);
             assert_eq!(st["max"], 2);
-            handle(&json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }), None);
+            handle(
+                &json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }),
+                None,
+            );
             let st = read_state(sid).unwrap();
             assert_eq!(st["status"], "running");
             assert!(st["next_due"].as_u64().unwrap() >= now_secs() + 590);
             // fire tick 2 by hand (the timer would in 10m), then end it: cap
             sched::fire(sid, st["gen"].as_u64().unwrap());
             purge_wakes(sid);
-            handle(&json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }), None);
+            handle(
+                &json!({ "method": "event/notify", "params": { "type": "turn_end", "session": sess } }),
+                None,
+            );
             let st = read_state(sid).unwrap();
             assert_eq!(st["status"], "done");
             assert!(st["notes"].as_str().unwrap().contains("cap"));
@@ -2431,8 +2534,16 @@ echo '{verdict_line}'
         with_home("loopmd", |home| {
             std::fs::create_dir_all(home).unwrap();
             std::fs::write(home.join("loop.md"), "- triage new issues\n").unwrap();
-            let r = call("command/run", json!({ "name": "/loop", "argv": [], "session": { "id": "s-md", "cwd": "" } }));
-            assert!(r["result"]["prompt"].as_str().unwrap().contains("triage new issues"));
+            let r = call(
+                "command/run",
+                json!({ "name": "/loop", "argv": [], "session": { "id": "s-md", "cwd": "" } }),
+            );
+            assert!(
+                r["result"]["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("triage new issues")
+            );
         });
     }
 
@@ -2442,7 +2553,10 @@ echo '{verdict_line}'
             let other = home.join("cron").join("inbox").join("someone-else");
             std::fs::create_dir_all(&other).unwrap();
             std::fs::write(other.join("loop-1.json"), "{}").unwrap();
-            call("command/run", json!({ "name": "/loop", "argv": ["x"], "session": { "id": "mine", "cwd": "/x" } }));
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["x"], "session": { "id": "mine", "cwd": "/x" } }),
+            );
             shutdown_cleanup();
             assert!(other.join("loop-1.json").exists());
         });
