@@ -623,7 +623,10 @@ pub(crate) fn widget_snapshot(sid: &str) -> Value {
                 let label = format!("\u{27f3} tick {}", iter + 1);
                 (
                     label.clone(),
-                    format!("loop   {label} · wakes in {}", fmt_clock(due.saturating_sub(now))),
+                    format!(
+                        "loop   {label} · wakes in {}",
+                        fmt_clock(due.saturating_sub(now))
+                    ),
                 )
             }
             None => {
@@ -634,10 +637,7 @@ pub(crate) fn widget_snapshot(sid: &str) -> Value {
                 let label = format!("\u{25cf} tick {iter} running");
                 (
                     label.clone(),
-                    format!(
-                        "loop   {label}  {}",
-                        fmt_dur(now.saturating_sub(started))
-                    ),
+                    format!("loop   {label}  {}", fmt_dur(now.saturating_sub(started))),
                 )
             }
         };
