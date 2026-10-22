@@ -125,7 +125,8 @@ fn manifest() -> Value {
         ],
         "commands": ["/loop"],
         "hooks": ["agent/before_start"],
-        "capabilities": ["host.ask", "host.say"],
+        "capabilities": ["host.ask", "host.say", "widget.override"],
+        "widget": true,
     })
 }
 
@@ -1999,6 +2000,11 @@ fn main() -> std::io::Result<()> {
         println!("{}", manifest());
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("widget") {
+        let sid = std::env::var("GRAY_SESSION_ID").unwrap_or_default();
+        println!("{}", sched::widget_snapshot(&sid));
+        return Ok(());
+    }
     if let Some(a) = args.first()
         && CLI_VERBS.contains(&a.as_str())
     {
@@ -2199,7 +2205,11 @@ mod tests {
     #[test]
     fn manifest_claims_ask_capability() {
         let m = call("plugin/manifest", Value::Null)["result"].clone();
-        assert_eq!(m["capabilities"], json!(["host.ask", "host.say"]));
+        assert_eq!(
+            m["capabilities"],
+            json!(["host.ask", "host.say", "widget.override"])
+        );
+        assert_eq!(m["widget"], json!(true));
     }
 
     #[test]
@@ -2548,6 +2558,66 @@ echo '{verdict_line}'
                     .contains("triage new issues")
             );
         });
+    }
+
+    #[test]
+    fn widget_counts_down_then_shows_the_running_tick() {
+        with_home("widget", |_| {
+            let sid = "s-w";
+            let sess = json!({ "id": sid, "cwd": "/x" });
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["5m", "check", "stuff"], "session": sess }),
+            );
+            // armed wait: turn_end sets next_due + reason
+            let mut st = read_state(sid).unwrap();
+            st["in_flight"] = json!(false);
+            st["next_due"] = json!(now_secs() + 80);
+            st["next_reason"] = json!("review fixes");
+            write_state(sid, &st).unwrap();
+            let snap = sched::widget_snapshot(sid);
+            let text = snap["text"].as_str().unwrap();
+            assert!(text.contains("\u{27f3} tick 2 · wakes in 1:20"), "{text}");
+            assert!(text.contains("waiting on review fixes"), "{text}");
+            assert!(!text.contains('/'), "no tick cap in the area: {text}");
+            assert_eq!(snap["shimmer_ranges"], json!([[1, 7, 15]]));
+            // mid-tick: fire() clears next_due and stamps tick_started_at
+            let mut st = read_state(sid).unwrap();
+            st["in_flight"] = json!(true);
+            st["tick_started_at"] = json!(now_secs() - 75);
+            st.as_object_mut().unwrap().remove("next_due");
+            write_state(sid, &st).unwrap();
+            let snap = sched::widget_snapshot(sid);
+            assert!(
+                snap["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\u{25cf} tick 1 running  1m15s"),
+                "{}",
+                snap["text"]
+            );
+            // stop/finish clears the area
+            let mut st = read_state(sid).unwrap();
+            st["status"] = json!("done");
+            write_state(sid, &st).unwrap();
+            assert_eq!(sched::widget_snapshot(sid)["text"], "");
+        });
+    }
+
+    #[test]
+    fn widget_stamp_gates_the_say_fallback() {
+        with_home("seen", |_| {
+            assert!(!sched::widget_seen_recently("s-seen"));
+            let _ = sched::widget_snapshot("s-seen");
+            assert!(sched::widget_seen_recently("s-seen"));
+        });
+    }
+
+    #[test]
+    fn countdown_formats_as_clock() {
+        assert_eq!(sched::fmt_clock(0), "0:00");
+        assert_eq!(sched::fmt_clock(80), "1:20");
+        assert_eq!(sched::fmt_clock(3729), "1:02:09");
     }
 
     #[test]

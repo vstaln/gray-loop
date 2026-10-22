@@ -194,6 +194,7 @@ pub(crate) fn start(argv: &[&str], sid: &str, cwd: &str) -> Option<Value> {
         "steer": [],
         "notes": "",
         "started_at": now_secs(),
+        "tick_started_at": now_secs(),
     });
     if let Err(e) = write_state(sid, &st) {
         return Some(json!({ "text": format!("loop: couldn't write state: {e}") }));
@@ -358,7 +359,7 @@ pub(crate) fn on_turn_end(sid: &str, link: Option<&HostLink>) {
     }
     drop(guard);
     arm(sid.to_string(), epoch, due);
-    if delay > 0 && streak < 2 {
+    if delay > 0 && streak < 2 && !widget_seen_recently(sid) {
         let why = if reason.is_empty() {
             String::new()
         } else {
@@ -476,6 +477,7 @@ pub(crate) fn fire(sid: &str, epoch: u64) {
     };
     st["in_flight"] = json!(true);
     st["pending_file"] = json!(file);
+    st["tick_started_at"] = json!(now_secs());
     if let Some(o) = st.as_object_mut() {
         o.remove("next_due");
     }
@@ -561,6 +563,97 @@ pub(crate) fn status_line(st: &Value) -> String {
             .unwrap_or(""),
         st.get("notes").and_then(Value::as_str).unwrap_or(""),
     )
+}
+
+/// `m:ss` (or `h:mm:ss`) countdown for the widget area — `18:42`, `1:02:09`.
+pub(crate) fn fmt_clock(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+fn widget_seen_path(sid: &str) -> PathBuf {
+    state_path(sid).with_file_name("widget.seen")
+}
+
+/// The host polls `<binary> widget` on a tick; the stamp tells [`say`]
+/// callers a widget-capable gray is already showing the area, so the
+/// transcript line stays a fallback for hosts that never poll.
+fn touch_widget_seen(sid: &str) {
+    let path = widget_seen_path(sid);
+    let stale = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|m| m.elapsed().unwrap_or_default() > Duration::from_secs(30))
+        .unwrap_or(true);
+    if stale {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, b"");
+    }
+}
+
+pub(crate) fn widget_seen_recently(sid: &str) -> bool {
+    std::fs::metadata(widget_seen_path(sid))
+        .and_then(|m| m.modified())
+        .ok()
+        .is_some_and(|m| m.elapsed().unwrap_or_default() < Duration::from_secs(75))
+}
+
+/// The above-composer status area (same mechanism gray-subagents uses):
+/// `loop   ⟳ tick 9 · wakes in 18:42` while armed, with the wake reason
+/// on a dim second line; `loop   ● tick 9 running  1m12s` mid-tick.
+/// Empty text clears the area — stop/finish needs no explicit teardown.
+pub(crate) fn widget_snapshot(sid: &str) -> Value {
+    touch_widget_seen(sid);
+    let mut text = String::new();
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+    if let Some(st) = read_state(sid)
+        && is_sched(&st)
+        && st.get("status").and_then(Value::as_str) == Some("running")
+    {
+        let iter = st.get("iter").and_then(Value::as_u64).unwrap_or(1);
+        let now = now_secs();
+        text.push('\n');
+        let (label, line) = match st.get("next_due").and_then(Value::as_u64) {
+            Some(due) => {
+                let label = format!("\u{27f3} tick {}", iter + 1);
+                (
+                    label.clone(),
+                    format!("loop   {label} · wakes in {}", fmt_clock(due.saturating_sub(now))),
+                )
+            }
+            None => {
+                let started = st
+                    .get("tick_started_at")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(now);
+                let label = format!("\u{25cf} tick {iter} running");
+                (
+                    label.clone(),
+                    format!(
+                        "loop   {label}  {}",
+                        fmt_dur(now.saturating_sub(started))
+                    ),
+                )
+            }
+        };
+        ranges.push((1, 7, 7 + label.chars().count()));
+        text.push_str(&line);
+        text.push('\n');
+        if let Some(reason) = st
+            .get("next_reason")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            text.push_str(&format!("     waiting on {reason}\n"));
+        }
+        text.push('\n');
+    }
+    json!({"version":1,"text":text,"shimmer_lines":[],"shimmer_ranges":ranges})
 }
 
 /// host/say — fire and forget (capability `host.say`; ungranted just errors).
