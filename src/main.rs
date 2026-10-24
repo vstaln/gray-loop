@@ -1801,11 +1801,22 @@ fn handle(req: &Value, link: Option<&HostLink>) -> (Option<Value>, bool) {
         "plugin/manifest" => manifest(),
         "agent/before_start" => before_start(&params, link),
         "command/run" => {
-            let argv: Vec<&str> = params
-                .get("argv")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
+            // The host's argv is shlex-parsed (quotes stripped, and once
+            // whitespace-split wholesale when quoting is unbalanced). `raw`
+            // is the verbatim text after the command name — prefer it so a
+            // goal/prompt/gate keeps apostrophes and quotes intact.
+            let owned: Vec<String>;
+            let argv: Vec<&str> = match params.get("raw").and_then(Value::as_str) {
+                Some(raw) => {
+                    owned = raw.split_whitespace().map(str::to_string).collect();
+                    owned.iter().map(String::as_str).collect()
+                }
+                None => params
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default(),
+            };
             run_command(&argv, &params)
         }
         "tool/call" => {
@@ -2342,6 +2353,33 @@ echo '{verdict_line}'
             );
             assert_eq!(read_state("s-r2").unwrap()["status"], "done");
             unsafe { std::env::remove_var("GRAY_LOOP_REVIEW_BIN") };
+        });
+    }
+
+    #[test]
+    fn raw_tail_keeps_quotes_and_apostrophes() {
+        with_home("rawtail", |home| {
+            let sess = json!({ "id": "s-raw", "cwd": home.to_string_lossy() });
+            // argv is what shlex produced; raw is the verbatim tail — raw wins.
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["goal", "fix", "it"],
+                        "raw": "goal fix it's \"quoted\" thing", "session": sess }),
+            );
+            let st = read_state("s-raw").unwrap();
+            assert_eq!(st["goal"], "fix it's \"quoted\" thing");
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["stop"], "session": sess }),
+            );
+
+            call(
+                "command/run",
+                json!({ "name": "/loop", "argv": ["goal", "x", "--gate", "grep", "a", "b", "f"],
+                        "raw": "goal x --gate \"grep 'a b' f\"", "session": sess }),
+            );
+            let st = read_state("s-raw").unwrap();
+            assert_eq!(st["gate"], "\"grep 'a b' f\"");
         });
     }
 
