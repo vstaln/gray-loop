@@ -74,7 +74,7 @@ fn manifest() -> Value {
         "protocol": "2.0",
         "tools": [
             {
-                "name": "loop_done",
+                "name": "loop_done", "label": "Loop done", "preview": "{status} · {reason|firstline}",
                 "description": "Stop the active /loop when the goal is verifiably complete (status \"done\") or unachievable (status \"failed\"). If the loop has a gate command, \"done\" arms it: it runs in the background and is re-checked on every iteration and every loop_done call — only exit 0 ends the loop. If the loop was started with --review, a detached second-agent review must return VERDICT CLEAR (or a human must override a NOVEL finding) before the gate or \"done\" is accepted. Only call when a loop is running.",
                 "parameters": {
                     "type": "object",
@@ -86,7 +86,7 @@ fn manifest() -> Value {
                 }
             },
             {
-                "name": "loop_wakeup",
+                "name": "loop_wakeup", "label": "Loop wakeup", "preview": "{delay_seconds}s · {reason|firstline}",
                 "description": "Pace a self-paced /loop: after this tick's work, schedule the next tick (delay_seconds 0 = continue right away, up to 3600) or end the loop (stop: true). If you don't re-arm during a tick, the loop ends after it. Same as running `gray loop wakeup <secs>` / `gray loop stop` in bash.",
                 "parameters": {
                     "type": "object",
@@ -99,7 +99,7 @@ fn manifest() -> Value {
                 }
             },
             {
-                "name": "loop_task",
+                "name": "loop_task", "label": "Loop task", "preview": "{op} · {text|firstline}",
                 "description": "Manage the active /loop's task checklist — the deterministic exit oracle. op \"add\" appends a task (needs text). op \"pass\"/\"fail\" set a task's passes flag (needs task: 1-based id, exact text, unique prefix, or unique substring). op \"list\" shows the checklist. When every task passes the loop ends itself.",
                 "parameters": {
                     "type": "object",
@@ -112,7 +112,7 @@ fn manifest() -> Value {
                 }
             },
             {
-                "name": "loop_learn",
+                "name": "loop_learn", "label": "Loop learned", "preview": "{text|firstline}",
                 "description": "Append one durable learning to the active /loop's log — something a future iteration must know (a decision made, a trap hit, a path that worked). Appended, never overwritten; last entries ride every continue prompt.",
                 "parameters": {
                     "type": "object",
