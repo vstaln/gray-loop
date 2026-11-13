@@ -124,6 +124,7 @@ fn manifest() -> Value {
             }
         ],
         "commands": ["/loop"],
+        "command_descriptions": {"/loop": "loop on a goal until its tasks pass"},
         "hooks": ["agent/before_start"],
         "capabilities": ["host.ask", "host.say", "widget.override"],
         "widget": true,
